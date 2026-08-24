@@ -72,3 +72,5 @@ This is sufficient for normal two-way sync started from the local machine: one s
 Pair does not write a local peer entry until remote provisioning succeeds. Remote provisioning itself cannot be globally atomic across two independent machines, but it is idempotent and safe to rerun after an interruption.
 
 Each machine also keeps local-only `.knowledge-sync/machine-facts.json` and `.knowledge-sync/sync-state.json` files. They remember environment-specific decisions and that machine's sync history, so the skill does not repeatedly rediscover a fact already classified as local.
+
+Use `/knowledge-sync:mine-facts` to have Claude analyze documents whose hashes changed since the last analysis. It creates sourced fact entries, records document and fact provenance in `.knowledge-sync/document-state.json` and `.knowledge-sync/fact-provenance.json`, and warns when a previously tracked document disappears without deleting anything.

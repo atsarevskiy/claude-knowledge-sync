@@ -21,11 +21,14 @@ LOG = STATE / "log.jsonl"
 ENVIRONMENT = STATE / "environment.json"
 MACHINE_FACTS = STATE / "machine-facts.json"
 SYNC_STATE = STATE / "sync-state.json"
+DOCUMENT_STATE = STATE / "document-state.json"
+FACT_PROVENANCE = STATE / "fact-provenance.json"
 REMOTE_SCRIPT = ".knowledge-sync/bin/knowledge_sync.py"
 DEFAULT_REMOTE_WORKSPACE = ".claude-knowledge-sync"
 FACT = re.compile(r'<!-- knowledge-sync:fact name="([^"]+)" -->\s*(.*?)\s*<!-- /knowledge-sync:fact -->', re.S)
 COMMON = re.compile(r"<common>\s*(.*?)\s*</common>", re.S)
 SCOPE = re.compile(r"<([A-Za-z][A-Za-z0-9_-]*)>\s*(.*?)\s*</\1>", re.S)
+DERIVED_FROM = re.compile(r'<!-- knowledge-sync:derived-from document="([^"]+)" hash="([0-9a-f]{64})" -->')
 SECRET = re.compile(r"(?:AKIA[0-9A-Z]{16}|-----BEGIN [A-Z ]*PRIVATE KEY-----|(?:api[_-]?key|secret|token|password)\s*[:=]\s*[^\s]{8,}|gh[pousr]_[A-Za-z0-9_]{20,})", re.I)
 DEFAULT_TOOL_CANDIDATES = [
     "claude", "codex", "git", "rg", "python3", "node", "npm", "bun", "go",
@@ -82,10 +85,7 @@ def ensure_documents(config: dict) -> None:
             f"# {doc['kind'].title()}\n\n"
             f"<{config['machine']}>\n"
             "<!-- Add machine-specific facts here with knowledge-sync:fact markers. -->\n"
-            f"</{config['machine']}>\n\n"
-            "<common>\n"
-            "<!-- Add portable facts here with knowledge-sync:fact markers. -->\n"
-            "</common>\n"
+            f"</{config['machine']}>\n"
         )
         log("document_scaffolded", document=doc["id"], path=str(path))
 
@@ -110,6 +110,62 @@ def read_json(path: Path, fallback: dict) -> dict:
         return json.loads(path.read_text()) if path.exists() else fallback
     except json.JSONDecodeError:
         return fallback
+
+
+def sha256_text(text: str) -> str:
+    return hashlib.sha256(text.encode()).hexdigest()
+
+
+def scan_document_state(config: dict) -> dict:
+    """Track current and historical document hashes without deleting history."""
+    state = read_json(DOCUMENT_STATE, {"format": 1, "machine": config["machine"], "documents": {}})
+    state["machine"] = config["machine"]
+    documents = state.setdefault("documents", {})
+    for doc in config["documents"]:
+        path = doc_path(doc)
+        previous = documents.get(doc["id"], {})
+        if not path.exists():
+            documents[doc["id"]] = {**previous, "path": str(path), "kind": doc.get("kind"),
+                                    "missing": True, "missing_since": previous.get("missing_since", now()),
+                                    "last_checked": now()}
+            continue
+        digest = sha256_text(path.read_text())
+        history = previous.get("hash_history", [])
+        if not history or history[-1].get("hash") != digest:
+            history.append({"hash": digest, "seen": now()})
+        documents[doc["id"]] = {"path": str(path), "kind": doc.get("kind"), "hash": digest,
+                                "hash_history": history, "missing": False, "last_checked": now()}
+    DOCUMENT_STATE.write_text(json.dumps(state, indent=2) + "\n")
+    return state
+
+
+def record_fact_provenance(config: dict, document_state: dict) -> None:
+    """Link every present fact to the hash of its source documents."""
+    state = read_json(FACT_PROVENANCE, {"format": 1, "machine": config["machine"], "facts": {}})
+    state["machine"] = config["machine"]
+    facts = state.setdefault("facts", {})
+    active = set()
+    hashes = document_state.get("documents", {})
+    for doc in config["documents"]:
+        source = hashes.get(doc["id"], {})
+        if source.get("missing") or not source.get("hash"):
+            continue
+        text = doc_path(doc).read_text()
+        for name, body in FACT.findall(text):
+            body_hash = sha256_text(canonical(body))
+            key = f"{doc['id']}:{name}:{body_hash}"
+            derived = [{"document": doc["id"], "hash": source["hash"]}]
+            derived.extend({"document": item[0], "hash": item[1]} for item in DERIVED_FROM.findall(body))
+            previous = facts.get(key, {})
+            facts[key] = {"name": name, "document": doc["id"], "fact_hash": body_hash,
+                          "sources": derived, "first_seen": previous.get("first_seen", now()),
+                          "last_seen": now(), "active": True}
+            active.add(key)
+    for key, value in facts.items():
+        if key not in active:
+            value["active"] = False
+    FACT_PROVENANCE.write_text(json.dumps(state, indent=2) + "\n")
+    log("fact_provenance_recorded", active=sum(v.get("active", False) for v in facts.values()))
 
 
 def record_machine_facts(config: dict) -> None:
@@ -221,6 +277,7 @@ def init(args: argparse.Namespace) -> None:
     })
     log("initialized", machine=args.machine)
     ensure_documents(load_config())
+    scan_document_state(load_config())
     if not args.no_discover_environment:
         discover_environment(load_config())
     print(f"Created {CONFIG}; edit document paths and peers before syncing.")
@@ -233,7 +290,9 @@ def provision(args: argparse.Namespace) -> None:
         init(argparse.Namespace(machine=args.machine, no_discover_environment=args.no_discover_environment))
         config = load_config()
     ensure_documents(config)
+    document_state = scan_document_state(config)
     record_machine_facts(config)
+    record_fact_provenance(config, document_state)
     print(f"Provisioned {Path.cwd()} for {config['machine']}.")
 
 
@@ -360,8 +419,10 @@ def discover_environment(config: dict) -> None:
 
 
 def check(config: dict, kind: str | None = None) -> None:
+    config = scoped_config(config, kind)
+    document_state = scan_document_state(config)
     problems = []
-    for doc in scoped_config(config, kind)["documents"]:
+    for doc in config["documents"]:
         path = doc_path(doc)
         if not path.exists():
             problems.append(f"{doc['id']}: missing {path}")
@@ -371,7 +432,8 @@ def check(config: dict, kind: str | None = None) -> None:
         print("CHECK FAILED", file=sys.stderr)
         print("\n".join(f"- {p}" for p in problems), file=sys.stderr)
         raise SystemExit(2)
-    record_machine_facts(scoped_config(config, kind))
+    record_machine_facts(config)
+    record_fact_provenance(config, document_state)
     print("CHECK OK: only explicit <common> fragments are eligible for export.")
 
 
@@ -584,8 +646,36 @@ def status(config: dict) -> None:
         print(f"  - {data['id']} ({data['reason']})")
     machine_facts = read_json(MACHINE_FACTS, {"facts": {}}).get("facts", {})
     sync_state = read_json(SYNC_STATE, {"events": []}).get("events", [])
+    document_state = read_json(DOCUMENT_STATE, {"documents": {}}).get("documents", {})
+    missing = [key for key, value in document_state.items() if value.get("missing")]
     print(f"machine-specific facts: {sum(v.get('active', False) for v in machine_facts.values())}")
     print(f"sync metadata events: {len(sync_state)}")
+    print("missing documents: " + (", ".join(missing) if missing else "none"))
+
+
+def analysis_status(config: dict) -> None:
+    state = scan_document_state(config)
+    changed = []
+    missing = []
+    for doc_id, value in state.get("documents", {}).items():
+        if value.get("missing"):
+            missing.append(doc_id)
+        elif value.get("hash") != value.get("last_analyzed_hash"):
+            changed.append(doc_id)
+    print(json.dumps({"changed_or_previously_changed": changed, "missing": missing,
+                      "documents": state.get("documents", {})}, indent=2))
+
+
+def mark_analyzed(config: dict) -> None:
+    state = scan_document_state(config)
+    for value in state.get("documents", {}).values():
+        if not value.get("missing") and value.get("hash"):
+            value["last_analyzed_hash"] = value["hash"]
+            value["last_analyzed_at"] = now()
+    DOCUMENT_STATE.write_text(json.dumps(state, indent=2) + "\n")
+    record_fact_provenance(config, state)
+    log("facts_analyzed")
+    print("Recorded current document hashes as analyzed.")
 
 
 def rollback(config: dict, snapshot_id: str) -> None:
@@ -612,6 +702,8 @@ def main() -> None:
     p = sub.add_parser("pair"); p.add_argument("--ssh-target", required=True); p.add_argument("--workspace"); p.add_argument("--name"); p.add_argument("--machine"); p.add_argument("--register-reverse", action="store_true"); p.add_argument("--local-ssh-target")
     sub.add_parser("discover-environment")
     sub.add_parser("record-machine-facts")
+    sub.add_parser("analysis-status")
+    sub.add_parser("mark-analyzed")
     p = sub.add_parser("check"); p.add_argument("--kind", choices=("memory", "steering"))
     p = sub.add_parser("snapshot"); p.add_argument("--reason", default="manual snapshot")
     p = sub.add_parser("export"); p.add_argument("--output", type=Path, required=True); p.add_argument("--kind", choices=("memory", "steering"))
@@ -627,6 +719,8 @@ def main() -> None:
     if args.command == "add-peer": return add_peer_command(config, args)
     if args.command == "discover-environment": return discover_environment(config)
     if args.command == "record-machine-facts": return record_machine_facts(config)
+    if args.command == "analysis-status": return analysis_status(config)
+    if args.command == "mark-analyzed": return mark_analyzed(config)
     if args.command == "check": return check(config, args.kind)
     if args.command == "snapshot": print(snapshot(config, args.reason)); return
     if args.command == "export": return export(config, args.output, args.kind)

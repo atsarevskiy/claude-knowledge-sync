@@ -75,6 +75,10 @@ Use the included script for initialization, checks, snapshots, filtered bundle e
 
 `machine-facts.json` and `sync-state.json` are local-only state. They are updated on each machine independently, never included in bundles, and let a machine resume synchronization or inspect its earlier classification decisions. Run `record-machine-facts` after manually editing a machine-scoped fact; ordinary `check` and `sync` already do this automatically.
 
+## Fact mining and source tracking
+
+Use `/knowledge-sync:mine-facts` to analyze memories and steering documents. It considers document hashes, reanalyzes only changed documents by default, and records source hashes for every derived fact. It must report a missing previously tracked document and never recreate or delete it automatically. `<common>` blocks are created only when a portable fact is actually added; empty shared sections are not scaffolding.
+
 ## Conflict handling
 
 Facts use the `knowledge-sync:fact` marker and a stable `name`. If the same named fact differs between machines, first assess whether both statements can be expressed as one non-lossy fact. Before writing any proposed resolution, create a snapshot. Preserve the original local and remote versions in a `knowledge-sync:conflict` block and record it in the audit log; do not silently pick a winner. Unnamed shared content is appended only when not already present.

@@ -28,6 +28,10 @@ Put named local decisions inside a machine scope using the same fact marker as s
 
 `.knowledge-sync/sync-state.json` separately appends local sync/export/merge/pull metadata. Both metadata files are deliberately absent from export bundles, so every machine owns and maintains its own history.
 
+## Analysis provenance and disappearance detection
+
+`.knowledge-sync/document-state.json` retains the hash history of every configured memory and steering document and records the current analysis hash. `.knowledge-sync/fact-provenance.json` links each fact body to the hashes of documents that produced it, including any explicit `derived-from` references added by fact mining. If a formerly present document is absent, its state is marked missing and surfaced by `status` and `analysis-status`; no document, fact, or historical hash is deleted automatically.
+
 ## Transfer
 
 The remote workspace is optional. If omitted, it is `.claude-knowledge-sync` relative to the remote login directory. Use an explicit workspace only when synchronizing a particular repository's memory or steering files, because SSH has no reliable way to infer the desired remote repository from a hostname alone.
