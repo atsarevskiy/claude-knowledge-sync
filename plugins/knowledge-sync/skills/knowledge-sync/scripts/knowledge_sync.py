@@ -1,0 +1,468 @@
+#!/usr/bin/env python3
+"""Additive, local-only support for the knowledge-sync Claude Code skill."""
+from __future__ import annotations
+
+import argparse
+import datetime as dt
+import hashlib
+import json
+import re
+import shlex
+import shutil
+import subprocess
+import sys
+from pathlib import Path
+from collections import Counter
+
+STATE = Path(".knowledge-sync")
+CONFIG = STATE / "config.json"
+LOG = STATE / "log.jsonl"
+ENVIRONMENT = STATE / "environment.json"
+FACT = re.compile(r'<!-- knowledge-sync:fact name="([^"]+)" -->\s*(.*?)\s*<!-- /knowledge-sync:fact -->', re.S)
+COMMON = re.compile(r"<common>\s*(.*?)\s*</common>", re.S)
+SECRET = re.compile(r"(?:AKIA[0-9A-Z]{16}|-----BEGIN [A-Z ]*PRIVATE KEY-----|(?:api[_-]?key|secret|token|password)\s*[:=]\s*[^\s]{8,}|gh[pousr]_[A-Za-z0-9_]{20,})", re.I)
+DEFAULT_TOOL_CANDIDATES = [
+    "claude", "codex", "git", "rg", "python3", "node", "npm", "bun", "go",
+    "docker", "kubectl", "helm", "terraform", "ansible", "ssh", "rsync",
+]
+SHELL_OPERATORS = {"|", "||", "&&", ";", "&", "("}
+
+
+def now() -> str:
+    return dt.datetime.now(dt.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+
+
+def load_config() -> dict:
+    if not CONFIG.exists():
+        raise SystemExit("No .knowledge-sync/config.json. Run init first.")
+    try:
+        config = json.loads(CONFIG.read_text())
+    except json.JSONDecodeError as exc:
+        raise SystemExit(f"Invalid config: {exc}") from exc
+    if not isinstance(config.get("machine"), str) or not config["machine"]:
+        raise SystemExit("config.machine must be a non-empty string")
+    docs = config.get("documents")
+    if not isinstance(docs, list) or not docs:
+        raise SystemExit("config.documents must be a non-empty list")
+    for doc in docs:
+        path = Path(doc.get("path", ""))
+        if not isinstance(doc.get("id"), str) or path.is_absolute() or ".." in path.parts:
+            raise SystemExit("Every document needs an id and a workspace-relative path without '..'")
+    for peer in config.get("peers", []):
+        if not all(isinstance(peer.get(key), str) and peer[key] for key in ("name", "ssh_target", "workspace")):
+            raise SystemExit("Every peer needs non-empty name, ssh_target, and workspace fields")
+    return config
+
+
+def log(event: str, **data: object) -> None:
+    STATE.mkdir(exist_ok=True)
+    with LOG.open("a") as stream:
+        stream.write(json.dumps({"time": now(), "event": event, **data}, sort_keys=True) + "\n")
+
+
+def doc_path(doc: dict) -> Path:
+    return Path(doc["path"])
+
+
+def scoped_config(config: dict, kind: str | None) -> dict:
+    if kind is None:
+        return config
+    if kind not in {"memory", "steering"}:
+        raise SystemExit("--kind must be memory or steering")
+    selected = [doc for doc in config["documents"] if doc.get("kind") == kind]
+    if not selected:
+        raise SystemExit(f"No configured document has kind: {kind}")
+    return {**config, "documents": selected}
+
+
+def common_parts(text: str) -> list[str]:
+    if text.count("<common>") != text.count("</common>"):
+        raise ValueError("unclosed <common> scope")
+    parts = COMMON.findall(text)
+    if any("<common>" in part or "</common>" in part for part in parts):
+        raise ValueError("nested <common> scope")
+    return [part.strip() for part in parts if part.strip()]
+
+
+def validate_text(text: str, label: str) -> list[str]:
+    problems = []
+    try:
+        parts = common_parts(text)
+    except ValueError as exc:
+        return [f"{label}: {exc}"]
+    for part in parts:
+        if SECRET.search(part):
+            problems.append(f"{label}: possible secret in <common>; move it outside the shared scope")
+    return problems
+
+
+def snapshot(config: dict, reason: str) -> str:
+    snapshot_id = now()
+    folder = STATE / "snapshots" / snapshot_id
+    folder.mkdir(parents=True, exist_ok=False)
+    manifest = {"id": snapshot_id, "reason": reason, "documents": []}
+    for doc in config["documents"]:
+        source = doc_path(doc)
+        if source.exists():
+            target = folder / doc["id"]
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(source, target)
+            manifest["documents"].append({"id": doc["id"], "path": doc["path"], "saved_as": doc["id"]})
+    (folder / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
+    log("snapshot", snapshot=snapshot_id, reason=reason)
+    return snapshot_id
+
+
+def canonical(value: str) -> str:
+    return "\n".join(line.rstrip() for line in value.strip().splitlines())
+
+
+def conflict(name: str, local: str, remote: str, source: str) -> str:
+    return ("<!-- knowledge-sync:conflict name=\"%s\" source=\"%s\" -->\n"
+            "LOCAL VERSION:\n%s\n\nREMOTE VERSION:\n%s\n"
+            "<!-- /knowledge-sync:conflict -->" % (name, source, local, remote))
+
+
+def init(args: argparse.Namespace) -> None:
+    if CONFIG.exists():
+        raise SystemExit("Refusing to overwrite existing configuration")
+    STATE.mkdir(exist_ok=True)
+    CONFIG.write_text(json.dumps({
+        "machine": args.machine,
+        "documents": [
+            {"id": "memory", "path": ".claude/memory.md", "kind": "memory"},
+            {"id": "steering", "path": "CLAUDE.md", "kind": "steering"}
+        ],
+        "peers": [],
+        # This section and environment.json are intentionally local-only.  They
+        # are never put in an export bundle.
+        "environment_discovery": {
+            "tool_candidates": DEFAULT_TOOL_CANDIDATES,
+            "history_files": [],
+            "include_claude_history": True,
+        },
+    }, indent=2) + "\n")
+    log("initialized", machine=args.machine)
+    if not args.no_discover_environment:
+        discover_environment(load_config())
+    print(f"Created {CONFIG}; edit document paths and peers before syncing.")
+
+
+def command_from_shell(line: str) -> str | None:
+    """Extract only a command name; never retain shell arguments from history."""
+    line = re.sub(r"^:\s*\d+:\d+;", "", line).strip()
+    if not line or line.startswith("#"):
+        return None
+    try:
+        words = shlex.split(line, comments=True)
+    except ValueError:
+        return None
+    for word in words:
+        if word in SHELL_OPERATORS:
+            return None
+        if re.match(r"^[A-Za-z_][A-Za-z0-9_]*=", word):
+            continue
+        if word in {"command", "builtin", "env", "sudo", "time"}:
+            continue
+        return Path(word).name
+    return None
+
+
+def shell_history_files(config: dict) -> list[Path]:
+    settings = config.get("environment_discovery", {})
+    configured = [Path(p).expanduser() for p in settings.get("history_files", []) if isinstance(p, str)]
+    defaults = [Path.home() / ".zsh_history", Path.home() / ".bash_history"]
+    # An explicit list is useful for a scoped audit or test; otherwise use the
+    # normal local shell histories.
+    return list(dict.fromkeys(configured if configured else defaults))
+
+
+def claude_history_files(config: dict) -> list[Path]:
+    if not config.get("environment_discovery", {}).get("include_claude_history", True):
+        return []
+    projects = Path.home() / ".claude" / "projects"
+    if not projects.is_dir():
+        return []
+    # JSONL transcript records are read locally and reduced immediately to
+    # tool names; prompts, command arguments, and assistant text are discarded.
+    return sorted(projects.glob("**/*.jsonl"), key=lambda p: p.stat().st_mtime, reverse=True)[:200]
+
+
+def commands_from_claude_record(value: object) -> list[str]:
+    found: list[str] = []
+    if isinstance(value, dict):
+        if value.get("name") in {"Bash", "bash"}:
+            command = value.get("input", {}).get("command") if isinstance(value.get("input"), dict) else None
+            if isinstance(command, str):
+                parsed = command_from_shell(command)
+                if parsed:
+                    found.append(parsed)
+        for child in value.values():
+            found.extend(commands_from_claude_record(child))
+    elif isinstance(value, list):
+        for child in value:
+            found.extend(commands_from_claude_record(child))
+    return found
+
+
+def discover_environment(config: dict) -> None:
+    """Create a non-transferable, argument-free local machine profile."""
+    settings = config.get("environment_discovery", {})
+    candidates = settings.get("tool_candidates", DEFAULT_TOOL_CANDIDATES)
+    candidates = [tool for tool in candidates if isinstance(tool, str) and re.match(r"^[A-Za-z0-9._+-]+$", tool)]
+    used: Counter[str] = Counter()
+    sources: list[dict[str, object]] = []
+    for history in shell_history_files(config):
+        if not history.is_file():
+            continue
+        count = 0
+        try:
+            for line in history.read_text(errors="replace").splitlines()[-10000:]:
+                command = command_from_shell(line)
+                if command:
+                    used[command] += 1
+                    count += 1
+        except OSError as exc:
+            sources.append({"kind": "shell_history", "read": False, "error": str(exc)})
+            continue
+        sources.append({"kind": "shell_history", "read": True, "commands_observed": count})
+    claude_records = 0
+    for transcript in claude_history_files(config):
+        try:
+            for line in transcript.read_text(errors="replace").splitlines():
+                try:
+                    used.update(commands_from_claude_record(json.loads(line)))
+                    claude_records += 1
+                except json.JSONDecodeError:
+                    continue
+        except OSError:
+            continue
+    if claude_records:
+        sources.append({"kind": "claude_history", "read": True, "records_observed": claude_records})
+    observed = [name for name, _ in used.most_common(80)
+                if re.match(r"^[A-Za-z0-9._+-]+$", name)]
+    all_tools = list(dict.fromkeys(candidates + observed))
+    profile = {
+        "format": 1,
+        "machine": config["machine"],
+        "created": now(),
+        "scope": "machine-local; never exported or merged",
+        "sources": sources,
+        "tools": [
+            {"name": tool, "available": shutil.which(tool) is not None,
+             "observed_uses": used[tool]}
+            for tool in all_tools
+        ],
+    }
+    STATE.mkdir(exist_ok=True)
+    if ENVIRONMENT.exists():
+        # Environment data is local state, but preserve it with the same
+        # non-destructive discipline as the synchronised documents.
+        archive = STATE / "environment-snapshots" / f"{now()}.json"
+        archive.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(ENVIRONMENT, archive)
+        log("environment_snapshot", snapshot=str(archive), reason="before environment rediscovery")
+    ENVIRONMENT.write_text(json.dumps(profile, indent=2) + "\n")
+    log("environment_discovered", tools=len(profile["tools"]), sources=len(sources))
+    print(f"Wrote local environment profile: {ENVIRONMENT}")
+
+
+def check(config: dict, kind: str | None = None) -> None:
+    problems = []
+    for doc in scoped_config(config, kind)["documents"]:
+        path = doc_path(doc)
+        if not path.exists():
+            problems.append(f"{doc['id']}: missing {path}")
+        else:
+            problems += validate_text(path.read_text(), doc["id"])
+    if problems:
+        print("CHECK FAILED", file=sys.stderr)
+        print("\n".join(f"- {p}" for p in problems), file=sys.stderr)
+        raise SystemExit(2)
+    print("CHECK OK: only explicit <common> fragments are eligible for export.")
+
+
+def export(config: dict, output: Path, kind: str | None = None) -> None:
+    config = scoped_config(config, kind)
+    check(config)
+    docs = []
+    for doc in config["documents"]:
+        parts = common_parts(doc_path(doc).read_text())
+        docs.append({"id": doc["id"], "kind": doc.get("kind"), "common": parts,
+                     "sha256": hashlib.sha256("\n\n".join(parts).encode()).hexdigest()})
+    bundle = {"format": 1, "machine": config["machine"], "created": now(), "documents": docs}
+    output.parent.mkdir(parents=True, exist_ok=True)
+    output.write_text(json.dumps(bundle, indent=2) + "\n")
+    log("export", output=str(output), document_ids=[d["id"] for d in docs])
+    print(f"Wrote filtered bundle: {output}")
+
+
+def run(command: list[str]) -> None:
+    print("+ " + shlex.join(command))
+    subprocess.run(command, check=True)
+
+
+def remote_command(peer: dict, script: str, *arguments: str) -> list[str]:
+    command = "cd %s && python3 %s %s" % (
+        shlex.quote(peer["workspace"]),
+        shlex.quote(".claude/skills/knowledge-sync/scripts/knowledge_sync.py"),
+        shlex.join(list(arguments)),
+    )
+    # Do not rely on the account's login shell: it may be nushell, fish, etc.
+    remote = "sh -lc " + shlex.quote(command)
+    return ["ssh", peer["ssh_target"], remote]
+
+
+def remote_shell(peer: dict, command: str) -> list[str]:
+    """Run a POSIX-shell command without assuming the remote login shell."""
+    return ["ssh", peer["ssh_target"], "sh -lc " + shlex.quote(command)]
+
+
+def sync(config: dict, peer_name: str, kind: str | None = None, pull: bool = False) -> None:
+    peer = next((p for p in config.get("peers", []) if p["name"] == peer_name), None)
+    if not peer:
+        raise SystemExit(f"Unknown peer: {peer_name}")
+    config = scoped_config(config, kind)
+    check(config)
+    remote_check_args = ["check"] + (["--kind", kind] if kind else [])
+    run(remote_command(peer, "knowledge_sync.py", *remote_check_args))
+    stamp = now()
+    remote_outbox = f"{peer['workspace']}/.knowledge-sync/outbound/{config['machine']}"
+    remote_return = f"{remote_outbox}/{stamp}.json"
+    inbound = STATE / "inbox" / peer_name / f"{stamp}.json"
+    if pull:
+        run(remote_shell(peer, "mkdir -p " + shlex.quote(remote_outbox)))
+        remote_export_args = ["export", "--output", remote_return] + (["--kind", kind] if kind else [])
+        run(remote_command(peer, "knowledge_sync.py", *remote_export_args))
+        inbound.parent.mkdir(parents=True, exist_ok=True)
+        run(["rsync", "-az", "-e", "ssh", f"{peer['ssh_target']}:{remote_return}", str(inbound)])
+        merge(config, inbound)
+        log("sync_pull", peer=peer_name, inbound=str(inbound), kind=kind)
+        print(f"Pulled shared knowledge from {peer_name}.")
+        return
+    outbound = STATE / "outbound" / peer_name / f"{stamp}.json"
+    export(config, outbound)
+    remote_inbox = f"{peer['workspace']}/.knowledge-sync/inbox/{config['machine']}"
+    remote_bundle = f"{remote_inbox}/{stamp}.json"
+    run(remote_shell(peer, "mkdir -p " + shlex.quote(remote_inbox)))
+    run(["rsync", "-az", "-e", "ssh", str(outbound), f"{peer['ssh_target']}:{remote_bundle}"])
+    remote_merge_args = ["merge", "--bundle", remote_bundle] + (["--kind", kind] if kind else [])
+    run(remote_command(peer, "knowledge_sync.py", *remote_merge_args))
+    run(remote_shell(peer, "mkdir -p " + shlex.quote(remote_outbox)))
+    remote_export_args = ["export", "--output", remote_return] + (["--kind", kind] if kind else [])
+    run(remote_command(peer, "knowledge_sync.py", *remote_export_args))
+    inbound.parent.mkdir(parents=True, exist_ok=True)
+    run(["rsync", "-az", "-e", "ssh", f"{peer['ssh_target']}:{remote_return}", str(inbound)])
+    merge(config, inbound)
+    log("sync", peer=peer_name, outbound=str(outbound), inbound=str(inbound))
+    print(f"Two-way sync with {peer_name} completed.")
+
+
+def merge(config: dict, bundle_path: Path, kind: str | None = None) -> None:
+    bundle = json.loads(bundle_path.read_text())
+    if bundle.get("format") != 1 or not isinstance(bundle.get("machine"), str):
+        raise SystemExit("Unsupported or malformed bundle")
+    if bundle["machine"] == config["machine"]:
+        raise SystemExit("Refusing to merge a bundle exported by this same machine")
+    config = scoped_config(config, kind)
+    by_id = {doc["id"]: doc for doc in config["documents"]}
+    changes = []
+    for incoming in bundle.get("documents", []):
+        doc = by_id.get(incoming.get("id"))
+        if not doc or not isinstance(incoming.get("common"), list):
+            continue
+        path = doc_path(doc)
+        if not path.exists():
+            continue
+        existing = path.read_text()
+        problems = validate_text(existing, doc["id"])
+        for part in incoming["common"]:
+            problems += validate_text(f"<common>\n{part}\n</common>", f"remote {doc['id']}")
+        if problems:
+            raise SystemExit("Merge refused:\n" + "\n".join(problems))
+        local_parts = common_parts(existing)
+        local_facts = {name: body for part in local_parts for name, body in FACT.findall(part)}
+        additions = []
+        for part in incoming["common"]:
+            remote_facts = FACT.findall(part)
+            if remote_facts:
+                for name, body in remote_facts:
+                    if name not in local_facts:
+                        additions.append(part.strip())
+                    elif canonical(local_facts[name]) != canonical(body):
+                        additions.append(conflict(name, local_facts[name], body, bundle["machine"]))
+                continue
+            if canonical(part) not in {canonical(p) for p in local_parts}:
+                additions.append(part.strip())
+        unique = []
+        for item in additions:
+            if canonical(item) not in {canonical(x) for x in unique}:
+                unique.append(item)
+        if unique:
+            changes.append((path, "\n\n<common>\n" + "\n\n".join(unique) + "\n</common>\n", doc["id"], len(unique)))
+    if not changes:
+        log("merge_noop", source=bundle["machine"], bundle=str(bundle_path))
+        print("No new shared knowledge to merge.")
+        return
+    snapshot_id = snapshot(config, f"before merge from {bundle['machine']}")
+    for path, addition, doc_id, count in changes:
+        with path.open("a") as stream:
+            stream.write(addition)
+        log("merge", source=bundle["machine"], document=doc_id, additions=count, snapshot=snapshot_id)
+    print(f"Merged shared knowledge from {bundle['machine']} after snapshot {snapshot_id}.")
+
+
+def status(config: dict) -> None:
+    snapshots = sorted((STATE / "snapshots").glob("*/manifest.json")) if (STATE / "snapshots").exists() else []
+    print(f"machine: {config['machine']}")
+    print("documents:")
+    for doc in config["documents"]:
+        print(f"  - {doc['id']}: {doc['path']}")
+    print("snapshots:")
+    for manifest in snapshots:
+        data = json.loads(manifest.read_text())
+        print(f"  - {data['id']} ({data['reason']})")
+
+
+def rollback(config: dict, snapshot_id: str) -> None:
+    folder = STATE / "snapshots" / snapshot_id
+    manifest_path = folder / "manifest.json"
+    if not manifest_path.exists():
+        raise SystemExit(f"Unknown snapshot: {snapshot_id}")
+    manifest = json.loads(manifest_path.read_text())
+    before = snapshot(config, f"before rollback to {snapshot_id}")
+    for item in manifest["documents"]:
+        target = Path(item["path"])
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(folder / item["saved_as"], target)
+    log("rollback", restored=snapshot_id, snapshot_before=before)
+    print(f"Restored {snapshot_id}; current state was snapshotted as {before}.")
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser()
+    sub = parser.add_subparsers(dest="command", required=True)
+    p = sub.add_parser("init"); p.add_argument("--machine", required=True); p.add_argument("--no-discover-environment", action="store_true")
+    sub.add_parser("discover-environment")
+    p = sub.add_parser("check"); p.add_argument("--kind", choices=("memory", "steering"))
+    p = sub.add_parser("snapshot"); p.add_argument("--reason", default="manual snapshot")
+    p = sub.add_parser("export"); p.add_argument("--output", type=Path, required=True); p.add_argument("--kind", choices=("memory", "steering"))
+    p = sub.add_parser("merge"); p.add_argument("--bundle", type=Path, required=True); p.add_argument("--kind", choices=("memory", "steering"))
+    p = sub.add_parser("sync"); p.add_argument("--peer", required=True); p.add_argument("--kind", choices=("memory", "steering")); p.add_argument("--pull", action="store_true")
+    sub.add_parser("status")
+    p = sub.add_parser("rollback"); p.add_argument("--snapshot", required=True)
+    args = parser.parse_args()
+    if args.command == "init": return init(args)
+    config = load_config()
+    if args.command == "discover-environment": return discover_environment(config)
+    if args.command == "check": return check(config, args.kind)
+    if args.command == "snapshot": print(snapshot(config, args.reason)); return
+    if args.command == "export": return export(config, args.output, args.kind)
+    if args.command == "merge": return merge(config, args.bundle, args.kind)
+    if args.command == "sync": return sync(config, args.peer, args.kind, args.pull)
+    if args.command == "status": return status(config)
+    return rollback(config, args.snapshot)
+
+
+if __name__ == "__main__":
+    main()

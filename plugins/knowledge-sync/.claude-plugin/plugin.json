@@ -1,0 +1,6 @@
+{
+  "name": "knowledge-sync",
+  "version": "1.0.0",
+  "description": "Synchronize and merge Claude memories and steering documents across machines.",
+  "author": {"name": "Andrey Tsarevskiy"}
+}

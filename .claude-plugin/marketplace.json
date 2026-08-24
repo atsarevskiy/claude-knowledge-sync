@@ -1,0 +1,12 @@
+{
+  "name": "claude-knowledge-sync",
+  "description": "Environment-aware knowledge synchronization and merging for Claude Code.",
+  "owner": {"name": "Andrey Tsarevskiy"},
+  "plugins": [
+    {
+      "name": "knowledge-sync",
+      "source": "./plugins/knowledge-sync",
+      "description": "Environment-aware knowledge sync and merge across machines"
+    }
+  ]
+}
