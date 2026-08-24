@@ -241,7 +241,10 @@ def claude_history_files(config: dict) -> list[Path]:
 def commands_from_claude_record(value: object) -> list[str]:
     found: list[str] = []
     if isinstance(value, dict):
-        if value.get("name") in {"Bash", "bash"}:
+        # Transcript records are not schema-stable: nested metadata can use
+        # an object for `name`. Only compare scalar command names.
+        name = value.get("name")
+        if isinstance(name, str) and name in {"Bash", "bash"}:
             command = value.get("input", {}).get("command") if isinstance(value.get("input"), dict) else None
             if isinstance(command, str):
                 parsed = command_from_shell(command)
