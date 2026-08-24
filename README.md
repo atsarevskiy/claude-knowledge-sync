@@ -50,3 +50,5 @@ See [the plugin skill](plugins/knowledge-sync/skills/knowledge-sync/SKILL.md) fo
 - Add `--pull` to either command, or to `sync --peer B --pull`, to fetch and merge the peer's shared knowledge without sending local knowledge back.
 
 The plugin defaults to both configured memory and steering documents when no kind is selected.
+
+Each machine also keeps local-only `.knowledge-sync/machine-facts.json` and `.knowledge-sync/sync-state.json` files. They remember environment-specific decisions and that machine's sync history, so the skill does not repeatedly rediscover a fact already classified as local.

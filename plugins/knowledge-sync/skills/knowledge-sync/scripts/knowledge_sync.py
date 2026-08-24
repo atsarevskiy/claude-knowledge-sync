@@ -18,8 +18,11 @@ STATE = Path(".knowledge-sync")
 CONFIG = STATE / "config.json"
 LOG = STATE / "log.jsonl"
 ENVIRONMENT = STATE / "environment.json"
+MACHINE_FACTS = STATE / "machine-facts.json"
+SYNC_STATE = STATE / "sync-state.json"
 FACT = re.compile(r'<!-- knowledge-sync:fact name="([^"]+)" -->\s*(.*?)\s*<!-- /knowledge-sync:fact -->', re.S)
 COMMON = re.compile(r"<common>\s*(.*?)\s*</common>", re.S)
+SCOPE = re.compile(r"<([A-Za-z][A-Za-z0-9_-]*)>\s*(.*?)\s*</\1>", re.S)
 SECRET = re.compile(r"(?:AKIA[0-9A-Z]{16}|-----BEGIN [A-Z ]*PRIVATE KEY-----|(?:api[_-]?key|secret|token|password)\s*[:=]\s*[^\s]{8,}|gh[pousr]_[A-Za-z0-9_]{20,})", re.I)
 DEFAULT_TOOL_CANDIDATES = [
     "claude", "codex", "git", "rg", "python3", "node", "npm", "bun", "go",
@@ -73,6 +76,53 @@ def scoped_config(config: dict, kind: str | None) -> dict:
     if not selected:
         raise SystemExit(f"No configured document has kind: {kind}")
     return {**config, "documents": selected}
+
+
+def read_json(path: Path, fallback: dict) -> dict:
+    try:
+        return json.loads(path.read_text()) if path.exists() else fallback
+    except json.JSONDecodeError:
+        return fallback
+
+
+def record_machine_facts(config: dict) -> None:
+    """Record explicitly tagged non-common facts locally; never remove history."""
+    state = read_json(MACHINE_FACTS, {"format": 1, "machine": config["machine"], "facts": {}})
+    state["machine"] = config["machine"]
+    facts = state.setdefault("facts", {})
+    seen = set()
+    processed_ids = set()
+    for doc in config["documents"]:
+        processed_ids.add(doc["id"])
+        path = doc_path(doc)
+        if not path.exists():
+            continue
+        for scope, content in SCOPE.findall(path.read_text()):
+            if scope == "common":
+                continue
+            for name, body in FACT.findall(content):
+                key = f"{doc['id']}:{scope}:{name}"
+                digest = hashlib.sha256(canonical(body).encode()).hexdigest()
+                previous = facts.get(key, {})
+                facts[key] = {
+                    "name": name, "document": doc["id"], "scope": scope,
+                    "digest": digest, "first_seen": previous.get("first_seen", now()),
+                    "last_seen": now(), "active": True,
+                }
+                seen.add(key)
+    for key, value in facts.items():
+        if key.split(":", 1)[0] in processed_ids and key not in seen:
+            value["active"] = False
+    MACHINE_FACTS.write_text(json.dumps(state, indent=2) + "\n")
+    log("machine_facts_recorded", active=sum(v.get("active", False) for v in facts.values()))
+
+
+def record_sync_state(config: dict, event: str, **details: object) -> None:
+    """Append local-only sync metadata so either endpoint can resume independently."""
+    state = read_json(SYNC_STATE, {"format": 1, "machine": config["machine"], "events": []})
+    state["machine"] = config["machine"]
+    state.setdefault("events", []).append({"time": now(), "event": event, **details})
+    SYNC_STATE.write_text(json.dumps(state, indent=2) + "\n")
 
 
 def common_parts(text: str) -> list[str]:
@@ -279,6 +329,7 @@ def check(config: dict, kind: str | None = None) -> None:
         print("CHECK FAILED", file=sys.stderr)
         print("\n".join(f"- {p}" for p in problems), file=sys.stderr)
         raise SystemExit(2)
+    record_machine_facts(scoped_config(config, kind))
     print("CHECK OK: only explicit <common> fragments are eligible for export.")
 
 
@@ -294,6 +345,7 @@ def export(config: dict, output: Path, kind: str | None = None) -> None:
     output.parent.mkdir(parents=True, exist_ok=True)
     output.write_text(json.dumps(bundle, indent=2) + "\n")
     log("export", output=str(output), document_ids=[d["id"] for d in docs])
+    record_sync_state(config, "export", document_ids=[d["id"] for d in docs])
     print(f"Wrote filtered bundle: {output}")
 
 
@@ -338,6 +390,7 @@ def sync(config: dict, peer_name: str, kind: str | None = None, pull: bool = Fal
         run(["rsync", "-az", "-e", "ssh", f"{peer['ssh_target']}:{remote_return}", str(inbound)])
         merge(config, inbound)
         log("sync_pull", peer=peer_name, inbound=str(inbound), kind=kind)
+        record_sync_state(config, "pull", peer=peer_name, kind=kind, inbound=str(inbound))
         print(f"Pulled shared knowledge from {peer_name}.")
         return
     outbound = STATE / "outbound" / peer_name / f"{stamp}.json"
@@ -355,6 +408,7 @@ def sync(config: dict, peer_name: str, kind: str | None = None, pull: bool = Fal
     run(["rsync", "-az", "-e", "ssh", f"{peer['ssh_target']}:{remote_return}", str(inbound)])
     merge(config, inbound)
     log("sync", peer=peer_name, outbound=str(outbound), inbound=str(inbound))
+    record_sync_state(config, "sync", peer=peer_name, kind=kind, outbound=str(outbound), inbound=str(inbound))
     print(f"Two-way sync with {peer_name} completed.")
 
 
@@ -409,6 +463,7 @@ def merge(config: dict, bundle_path: Path, kind: str | None = None) -> None:
         with path.open("a") as stream:
             stream.write(addition)
         log("merge", source=bundle["machine"], document=doc_id, additions=count, snapshot=snapshot_id)
+    record_sync_state(config, "merge", source=bundle["machine"], kind=kind, snapshot=snapshot_id)
     print(f"Merged shared knowledge from {bundle['machine']} after snapshot {snapshot_id}.")
 
 
@@ -422,6 +477,10 @@ def status(config: dict) -> None:
     for manifest in snapshots:
         data = json.loads(manifest.read_text())
         print(f"  - {data['id']} ({data['reason']})")
+    machine_facts = read_json(MACHINE_FACTS, {"facts": {}}).get("facts", {})
+    sync_state = read_json(SYNC_STATE, {"events": []}).get("events", [])
+    print(f"machine-specific facts: {sum(v.get('active', False) for v in machine_facts.values())}")
+    print(f"sync metadata events: {len(sync_state)}")
 
 
 def rollback(config: dict, snapshot_id: str) -> None:
@@ -444,6 +503,7 @@ def main() -> None:
     sub = parser.add_subparsers(dest="command", required=True)
     p = sub.add_parser("init"); p.add_argument("--machine", required=True); p.add_argument("--no-discover-environment", action="store_true")
     sub.add_parser("discover-environment")
+    sub.add_parser("record-machine-facts")
     p = sub.add_parser("check"); p.add_argument("--kind", choices=("memory", "steering"))
     p = sub.add_parser("snapshot"); p.add_argument("--reason", default="manual snapshot")
     p = sub.add_parser("export"); p.add_argument("--output", type=Path, required=True); p.add_argument("--kind", choices=("memory", "steering"))
@@ -455,6 +515,7 @@ def main() -> None:
     if args.command == "init": return init(args)
     config = load_config()
     if args.command == "discover-environment": return discover_environment(config)
+    if args.command == "record-machine-facts": return record_machine_facts(config)
     if args.command == "check": return check(config, args.kind)
     if args.command == "snapshot": print(snapshot(config, args.reason)); return
     if args.command == "export": return export(config, args.output, args.kind)

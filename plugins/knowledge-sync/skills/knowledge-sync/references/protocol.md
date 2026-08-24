@@ -22,6 +22,12 @@ Refresh the profile with `discover-environment` after changing local tools or wo
 
 `<common>` is opt-in. Nested `<common>` blocks and unclosed scope tags are configuration errors. Machine labels are intentionally not interpreted as share permissions: every non-`common` block is retained only on its own machine.
 
+## Machine-specific fact memory
+
+Put named local decisions inside a machine scope using the same fact marker as shared facts. `check` records each one in the local `.knowledge-sync/machine-facts.json` with its document, scope, digest, and first/last-seen times. The file retains inactive historical entries instead of deleting them. Before treating a finding as new or proposing that it become shared, inspect this record: a matching active local fact is already a deliberate environment-specific decision.
+
+`.knowledge-sync/sync-state.json` separately appends local sync/export/merge/pull metadata. Both metadata files are deliberately absent from export bundles, so every machine owns and maintains its own history.
+
 ## Transfer
 
 `sync --peer <name>` transfers generated JSON bundles with `rsync -az -e ssh` and invokes the installed remote skill with SSH. The bundle contains only the common fragments, document IDs, hashes, source machine name, and timestamps. It contains no full document, snapshots, configuration, or local-only fragments. The peer configuration (including host and workspace path) stays in its own local `.knowledge-sync/config.json` and is never transferred.
