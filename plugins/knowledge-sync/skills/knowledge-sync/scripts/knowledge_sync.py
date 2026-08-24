@@ -401,7 +401,7 @@ def output(command: list[str]) -> str:
 
 
 def shell_join(parts: list[str]) -> str:
-    """shlex.join is only available starting with Python 3.8."""
+    """Render shell-safe command text on both Python 3.7 and newer runtimes."""
     join = getattr(shlex, "join", None)
     return join(parts) if join else " ".join(shlex.quote(part) for part in parts)
 
