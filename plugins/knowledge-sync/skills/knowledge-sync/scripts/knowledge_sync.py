@@ -11,6 +11,7 @@ import shlex
 import shutil
 import subprocess
 import sys
+import socket
 from pathlib import Path
 from collections import Counter
 
@@ -20,6 +21,8 @@ LOG = STATE / "log.jsonl"
 ENVIRONMENT = STATE / "environment.json"
 MACHINE_FACTS = STATE / "machine-facts.json"
 SYNC_STATE = STATE / "sync-state.json"
+REMOTE_SCRIPT = ".knowledge-sync/bin/knowledge_sync.py"
+DEFAULT_REMOTE_WORKSPACE = ".claude-knowledge-sync"
 FACT = re.compile(r'<!-- knowledge-sync:fact name="([^"]+)" -->\s*(.*?)\s*<!-- /knowledge-sync:fact -->', re.S)
 COMMON = re.compile(r"<common>\s*(.*?)\s*</common>", re.S)
 SCOPE = re.compile(r"<([A-Za-z][A-Za-z0-9_-]*)>\s*(.*?)\s*</\1>", re.S)
@@ -52,8 +55,9 @@ def load_config() -> dict:
         if not isinstance(doc.get("id"), str) or path.is_absolute() or ".." in path.parts:
             raise SystemExit("Every document needs an id and a workspace-relative path without '..'")
     for peer in config.get("peers", []):
-        if not all(isinstance(peer.get(key), str) and peer[key] for key in ("name", "ssh_target", "workspace")):
-            raise SystemExit("Every peer needs non-empty name, ssh_target, and workspace fields")
+        if not all(isinstance(peer.get(key), str) and peer[key] for key in ("name", "ssh_target")):
+            raise SystemExit("Every peer needs non-empty name and ssh_target fields")
+        peer.setdefault("workspace", DEFAULT_REMOTE_WORKSPACE)
     return config
 
 
@@ -65,6 +69,29 @@ def log(event: str, **data: object) -> None:
 
 def doc_path(doc: dict) -> Path:
     return Path(doc["path"])
+
+
+def ensure_documents(config: dict) -> None:
+    """Create safe empty templates for missing configured documents only."""
+    for doc in config["documents"]:
+        path = doc_path(doc)
+        if path.exists():
+            continue
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(
+            f"# {doc['kind'].title()}\n\n"
+            f"<{config['machine']}>\n"
+            "<!-- Add machine-specific facts here with knowledge-sync:fact markers. -->\n"
+            f"</{config['machine']}>\n\n"
+            "<common>\n"
+            "<!-- Add portable facts here with knowledge-sync:fact markers. -->\n"
+            "</common>\n"
+        )
+        log("document_scaffolded", document=doc["id"], path=str(path))
+
+
+def write_config(config: dict) -> None:
+    CONFIG.write_text(json.dumps(config, indent=2) + "\n")
 
 
 def scoped_config(config: dict, kind: str | None) -> dict:
@@ -177,7 +204,7 @@ def init(args: argparse.Namespace) -> None:
     if CONFIG.exists():
         raise SystemExit("Refusing to overwrite existing configuration")
     STATE.mkdir(exist_ok=True)
-    CONFIG.write_text(json.dumps({
+    write_config({
         "machine": args.machine,
         "documents": [
             {"id": "memory", "path": ".claude/memory.md", "kind": "memory"},
@@ -191,11 +218,23 @@ def init(args: argparse.Namespace) -> None:
             "history_files": [],
             "include_claude_history": True,
         },
-    }, indent=2) + "\n")
+    })
     log("initialized", machine=args.machine)
+    ensure_documents(load_config())
     if not args.no_discover_environment:
         discover_environment(load_config())
     print(f"Created {CONFIG}; edit document paths and peers before syncing.")
+
+
+def provision(args: argparse.Namespace) -> None:
+    if CONFIG.exists():
+        config = load_config()
+    else:
+        init(argparse.Namespace(machine=args.machine, no_discover_environment=args.no_discover_environment))
+        config = load_config()
+    ensure_documents(config)
+    record_machine_facts(config)
+    print(f"Provisioned {Path.cwd()} for {config['machine']}.")
 
 
 def command_from_shell(line: str) -> str | None:
@@ -357,10 +396,14 @@ def run(command: list[str]) -> None:
     subprocess.run(command, check=True)
 
 
+def output(command: list[str]) -> str:
+    return subprocess.run(command, check=True, text=True, stdout=subprocess.PIPE).stdout.strip()
+
+
 def remote_command(peer: dict, script: str, *arguments: str) -> list[str]:
     command = "cd %s && python3 %s %s" % (
         shlex.quote(peer["workspace"]),
-        shlex.quote(".claude/skills/knowledge-sync/scripts/knowledge_sync.py"),
+        shlex.quote(REMOTE_SCRIPT),
         shlex.join(list(arguments)),
     )
     # Do not rely on the account's login shell: it may be nushell, fish, etc.
@@ -373,12 +416,63 @@ def remote_shell(peer: dict, command: str) -> list[str]:
     return ["ssh", peer["ssh_target"], "sh -lc " + shlex.quote(command)]
 
 
+def verify_peer(peer: dict) -> None:
+    run(remote_shell(peer, "command -v python3 >/dev/null && command -v rsync >/dev/null"))
+
+
+def provision_peer(peer: dict, machine: str) -> None:
+    """Install only this script and scaffold its isolated remote workspace."""
+    workspace = peer.get("workspace", DEFAULT_REMOTE_WORKSPACE)
+    run(remote_shell(peer, "mkdir -p " + shlex.quote(f"{workspace}/.knowledge-sync/bin")))
+    run(["rsync", "-az", "-e", "ssh", str(Path(__file__).resolve()),
+         f"{peer['ssh_target']}:{workspace}/{REMOTE_SCRIPT}"])
+    run(remote_command(peer, "knowledge_sync.py", "provision", "--machine", machine,
+                       "--no-discover-environment"))
+
+
+def add_peer(config: dict, name: str, ssh_target: str, workspace: str | None) -> None:
+    peer = {"name": name, "ssh_target": ssh_target,
+            "workspace": workspace or DEFAULT_REMOTE_WORKSPACE}
+    verify_peer(peer)
+    peers = [item for item in config.get("peers", []) if item.get("name") != name]
+    peers.append(peer)
+    config["peers"] = peers
+    write_config(config)
+    log("peer_added", name=name, ssh_target=ssh_target, workspace=peer["workspace"])
+    record_sync_state(config, "peer_added", name=name)
+    print(f"Registered and verified peer {name}.")
+
+
+def add_peer_command(config: dict, args: argparse.Namespace) -> None:
+    add_peer(config, args.name, args.ssh_target, args.workspace)
+
+
+def pair(args: argparse.Namespace) -> None:
+    local_machine = args.machine or socket.gethostname().split(".")[0]
+    if not CONFIG.exists():
+        init(argparse.Namespace(machine=local_machine, no_discover_environment=False))
+    config = load_config()
+    remote_workspace = args.workspace or DEFAULT_REMOTE_WORKSPACE
+    remote_name = args.name or output(["ssh", args.ssh_target, "hostname -s"])
+    peer = {"name": remote_name, "ssh_target": args.ssh_target, "workspace": remote_workspace}
+    verify_peer(peer)
+    provision_peer(peer, remote_name)
+    add_peer(config, remote_name, args.ssh_target, remote_workspace)
+    reverse_target = args.local_ssh_target or socket.gethostname()
+    reverse_workspace = str(Path.cwd().resolve())
+    reverse_args = ["add-peer", "--name", config["machine"], "--ssh-target", reverse_target,
+                    "--workspace", reverse_workspace]
+    run(remote_command(peer, "knowledge_sync.py", *reverse_args))
+    print(f"Paired {config['machine']} with {remote_name}.")
+
+
 def sync(config: dict, peer_name: str, kind: str | None = None, pull: bool = False) -> None:
     peer = next((p for p in config.get("peers", []) if p["name"] == peer_name), None)
     if not peer:
         raise SystemExit(f"Unknown peer: {peer_name}")
     config = scoped_config(config, kind)
     check(config)
+    provision_peer(peer, peer_name)
     remote_check_args = ["check"] + (["--kind", kind] if kind else [])
     run(remote_command(peer, "knowledge_sync.py", *remote_check_args))
     stamp = now()
@@ -505,6 +599,9 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     sub = parser.add_subparsers(dest="command", required=True)
     p = sub.add_parser("init"); p.add_argument("--machine", required=True); p.add_argument("--no-discover-environment", action="store_true")
+    p = sub.add_parser("provision"); p.add_argument("--machine", required=True); p.add_argument("--no-discover-environment", action="store_true")
+    p = sub.add_parser("add-peer"); p.add_argument("--name", required=True); p.add_argument("--ssh-target", required=True); p.add_argument("--workspace")
+    p = sub.add_parser("pair"); p.add_argument("--ssh-target", required=True); p.add_argument("--workspace"); p.add_argument("--name"); p.add_argument("--machine"); p.add_argument("--local-ssh-target")
     sub.add_parser("discover-environment")
     sub.add_parser("record-machine-facts")
     p = sub.add_parser("check"); p.add_argument("--kind", choices=("memory", "steering"))
@@ -516,7 +613,10 @@ def main() -> None:
     p = sub.add_parser("rollback"); p.add_argument("--snapshot", required=True)
     args = parser.parse_args()
     if args.command == "init": return init(args)
+    if args.command == "provision": return provision(args)
+    if args.command == "pair": return pair(args)
     config = load_config()
+    if args.command == "add-peer": return add_peer_command(config, args)
     if args.command == "discover-environment": return discover_environment(config)
     if args.command == "record-machine-facts": return record_machine_facts(config)
     if args.command == "check": return check(config, args.kind)

@@ -17,7 +17,7 @@ For local development, replace `atsarevskiy/claude-knowledge-sync` with the loca
 
 ## Initialize and sync
 
-On each machine, open the target workspace in Claude Code and invoke `/knowledge-sync:knowledge-sync` to configure the local machine.
+On each machine, open the target workspace in Claude Code and invoke `/knowledge-sync:knowledge-sync` to configure the local machine. Initialization scaffolds missing `.claude/memory.md` and `CLAUDE.md` with safe local and shared sections, so `check` succeeds immediately.
 
 Configure the local `.knowledge-sync/config.json` with equivalent document IDs and an SSH peer, then run:
 
@@ -50,5 +50,23 @@ See [the plugin skill](plugins/knowledge-sync/skills/knowledge-sync/SKILL.md) fo
 - Add `--pull` to either command, or to `sync --peer B --pull`, to fetch and merge the peer's shared knowledge without sending local knowledge back.
 
 The plugin defaults to both configured memory and steering documents when no kind is selected.
+
+## Peer and pair bootstrap
+
+Register an existing peer and verify that Python and rsync are reachable over SSH:
+
+```bash
+knowledge_sync.py add-peer --name B --ssh-target you@host --workspace /path/to/workspace
+```
+
+`--workspace` is optional. Without it, the plugin uses `.claude-knowledge-sync` in the remote account's home directory. Specify it when the peer's knowledge should live in a particular repository: SSH cannot otherwise know which remote project owns `CLAUDE.md`.
+
+For first-time setup, use `pair`. It initializes the local workspace if needed, copies the sync script to the peer, scaffolds its documents and local state, then registers both peers:
+
+```bash
+knowledge_sync.py pair --ssh-target you@host --workspace /path/to/workspace
+```
+
+The peer must be able to SSH back to the local machine for reciprocal registration. Use `--local-ssh-target user@reachable-local-host` when the default local hostname is not reachable from the peer.
 
 Each machine also keeps local-only `.knowledge-sync/machine-facts.json` and `.knowledge-sync/sync-state.json` files. They remember environment-specific decisions and that machine's sync history, so the skill does not repeatedly rediscover a fact already classified as local.

@@ -46,6 +46,8 @@ Edit `.knowledge-sync/config.json` to name this machine, list the memories and s
 }]
 ```
 
+Prefer `add-peer --name B --ssh-target you@host [--workspace /path]` over editing the configuration by hand. It verifies SSH, Python, and rsync before registering the peer. Omit `--workspace` to use the remote account's `.claude-knowledge-sync` directory. Use `pair --ssh-target you@host [--workspace /path]` for first-time setup: it scaffolds the local documents, provisions the remote script and documents, and registers both directions. Pairing requires the remote machine to reach the local machine over SSH; pass `--local-ssh-target` if the local hostname is not routable from the peer.
+
 Use `<common>` only for portable knowledge. For example:
 
 ```markdown
@@ -64,7 +66,7 @@ The local staging proxy listens on port 4318.
 
 ## Sync procedure
 
-1. Verify SSH access and ensure this same skill exists at the peer workspace.
+1. Run `add-peer` or `pair` for a new peer. Normal sync automatically refreshes the remote helper script and scaffolds missing remote documents; a pre-installed remote workspace is not required.
 2. Run `check` locally. Correct every reported secret or configuration problem.
 3. Run `sync --peer B`. It runs `check` remotely, then uses `rsync -az -e ssh` to transfer only a filtered JSON bundle, asks the remote skill to merge it, and repeats the transfer in reverse. Every merge creates its own pre-write snapshot. Add `--pull` to receive and merge the peer's shared knowledge without sending local knowledge back.
 4. Inspect `status` and `.knowledge-sync/log.jsonl` on both machines. Resolve any conflict blocks with the user when meaning matters; never choose a version by deleting the other.

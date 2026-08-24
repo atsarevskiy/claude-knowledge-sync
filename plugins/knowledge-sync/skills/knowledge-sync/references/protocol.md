@@ -30,6 +30,8 @@ Put named local decisions inside a machine scope using the same fact marker as s
 
 ## Transfer
 
+The remote workspace is optional. If omitted, it is `.claude-knowledge-sync` relative to the remote login directory. Use an explicit workspace only when synchronizing a particular repository's memory or steering files, because SSH has no reliable way to infer the desired remote repository from a hostname alone.
+
 `sync --peer <name>` transfers generated JSON bundles with `rsync -az -e ssh` and invokes the installed remote skill with SSH. The bundle contains only the common fragments, document IDs, hashes, source machine name, and timestamps. It contains no full document, snapshots, configuration, or local-only fragments. The peer configuration (including host and workspace path) stays in its own local `.knowledge-sync/config.json` and is never transferred.
 
 Suggested manual exchange:
