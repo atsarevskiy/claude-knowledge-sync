@@ -46,7 +46,7 @@ Edit `.knowledge-sync/config.json` to name this machine, list the memories and s
 }]
 ```
 
-Prefer `add-peer --name B --ssh-target you@host [--workspace /path]` over editing the configuration by hand. It verifies SSH, Python, and rsync before registering the peer. Omit `--workspace` to use the remote account's `.claude-knowledge-sync` directory. Use `pair --ssh-target you@host [--workspace /path]` for first-time setup: it scaffolds the local documents, provisions the remote script and documents, and registers both directions. Pairing requires the remote machine to reach the local machine over SSH; pass `--local-ssh-target` if the local hostname is not routable from the peer.
+Prefer `add-peer --name B --ssh-target you@host [--workspace /path]` over editing the configuration by hand. It verifies SSH, Python, and rsync before registering the peer. Omit `--workspace` to use the remote account's `.claude-knowledge-sync` directory. Use `pair --ssh-target you@host [--workspace /path]` for first-time setup: it scaffolds the local documents, provisions the remote script and documents, and registers the remote peer locally. That is enough for a normal two-way sync initiated locally. Register the reverse peer only when needed by adding `--register-reverse --local-ssh-target user@reachable-local-host`; do not guess a reverse SSH target. Pair writes no local peer entry until remote provisioning succeeds, though provisioning two independent machines cannot be a globally atomic transaction.
 
 Use `<common>` only for portable knowledge. For example:
 

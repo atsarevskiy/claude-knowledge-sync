@@ -61,12 +61,14 @@ knowledge_sync.py add-peer --name B --ssh-target you@host --workspace /path/to/w
 
 `--workspace` is optional. Without it, the plugin uses `.claude-knowledge-sync` in the remote account's home directory. Specify it when the peer's knowledge should live in a particular repository: SSH cannot otherwise know which remote project owns `CLAUDE.md`.
 
-For first-time setup, use `pair`. It initializes the local workspace if needed, copies the sync script to the peer, scaffolds its documents and local state, then registers both peers:
+For first-time setup, use `pair`. It initializes the local workspace if needed, copies the sync script to the peer, scaffolds its documents and local state, then registers the remote peer locally:
 
 ```bash
 knowledge_sync.py pair --ssh-target you@host --workspace /path/to/workspace
 ```
 
-The peer must be able to SSH back to the local machine for reciprocal registration. Use `--local-ssh-target user@reachable-local-host` when the default local hostname is not reachable from the peer.
+This is sufficient for normal two-way sync started from the local machine: one sync exchanges knowledge in both directions. Reverse registration is optional and only needed when you want to initiate sync from the remote machine too. Enable it explicitly with `--register-reverse --local-ssh-target user@reachable-local-host`; no local hostname is guessed.
+
+Pair does not write a local peer entry until remote provisioning succeeds. Remote provisioning itself cannot be globally atomic across two independent machines, but it is idempotent and safe to rerun after an interruption.
 
 Each machine also keeps local-only `.knowledge-sync/machine-facts.json` and `.knowledge-sync/sync-state.json` files. They remember environment-specific decisions and that machine's sync history, so the skill does not repeatedly rediscover a fact already classified as local.

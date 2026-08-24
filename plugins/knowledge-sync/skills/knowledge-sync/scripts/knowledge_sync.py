@@ -392,7 +392,7 @@ def export(config: dict, output: Path, kind: str | None = None) -> None:
 
 
 def run(command: list[str]) -> None:
-    print("+ " + shlex.join(command))
+    print("+ " + shell_join(command))
     subprocess.run(command, check=True)
 
 
@@ -400,11 +400,17 @@ def output(command: list[str]) -> str:
     return subprocess.run(command, check=True, text=True, stdout=subprocess.PIPE).stdout.strip()
 
 
+def shell_join(parts: list[str]) -> str:
+    """shlex.join is only available starting with Python 3.8."""
+    join = getattr(shlex, "join", None)
+    return join(parts) if join else " ".join(shlex.quote(part) for part in parts)
+
+
 def remote_command(peer: dict, script: str, *arguments: str) -> list[str]:
     command = "cd %s && python3 %s %s" % (
         shlex.quote(peer["workspace"]),
         shlex.quote(REMOTE_SCRIPT),
-        shlex.join(list(arguments)),
+        shell_join(list(arguments)),
     )
     # Do not rely on the account's login shell: it may be nushell, fish, etc.
     remote = "sh -lc " + shlex.quote(command)
@@ -456,13 +462,15 @@ def pair(args: argparse.Namespace) -> None:
     remote_name = args.name or output(["ssh", args.ssh_target, "hostname -s"])
     peer = {"name": remote_name, "ssh_target": args.ssh_target, "workspace": remote_workspace}
     verify_peer(peer)
+    # Do not register either peer until the remote helper and documents exist.
     provision_peer(peer, remote_name)
+    if args.register_reverse:
+        if not args.local_ssh_target:
+            raise SystemExit("--register-reverse requires --local-ssh-target")
+        reverse_args = ["add-peer", "--name", config["machine"], "--ssh-target",
+                        args.local_ssh_target, "--workspace", str(Path.cwd().resolve())]
+        run(remote_command(peer, "knowledge_sync.py", *reverse_args))
     add_peer(config, remote_name, args.ssh_target, remote_workspace)
-    reverse_target = args.local_ssh_target or socket.gethostname()
-    reverse_workspace = str(Path.cwd().resolve())
-    reverse_args = ["add-peer", "--name", config["machine"], "--ssh-target", reverse_target,
-                    "--workspace", reverse_workspace]
-    run(remote_command(peer, "knowledge_sync.py", *reverse_args))
     print(f"Paired {config['machine']} with {remote_name}.")
 
 
@@ -601,7 +609,7 @@ def main() -> None:
     p = sub.add_parser("init"); p.add_argument("--machine", required=True); p.add_argument("--no-discover-environment", action="store_true")
     p = sub.add_parser("provision"); p.add_argument("--machine", required=True); p.add_argument("--no-discover-environment", action="store_true")
     p = sub.add_parser("add-peer"); p.add_argument("--name", required=True); p.add_argument("--ssh-target", required=True); p.add_argument("--workspace")
-    p = sub.add_parser("pair"); p.add_argument("--ssh-target", required=True); p.add_argument("--workspace"); p.add_argument("--name"); p.add_argument("--machine"); p.add_argument("--local-ssh-target")
+    p = sub.add_parser("pair"); p.add_argument("--ssh-target", required=True); p.add_argument("--workspace"); p.add_argument("--name"); p.add_argument("--machine"); p.add_argument("--register-reverse", action="store_true"); p.add_argument("--local-ssh-target")
     sub.add_parser("discover-environment")
     sub.add_parser("record-machine-facts")
     p = sub.add_parser("check"); p.add_argument("--kind", choices=("memory", "steering"))
