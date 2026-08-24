@@ -38,7 +38,7 @@ SHELL_OPERATORS = {"|", "||", "&&", ";", "&", "("}
 
 
 def now() -> str:
-    return dt.datetime.now(dt.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    return dt.datetime.now(dt.timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
 
 
 def load_config() -> dict:
@@ -134,7 +134,9 @@ def scan_document_state(config: dict) -> dict:
         if not history or history[-1].get("hash") != digest:
             history.append({"hash": digest, "seen": now()})
         documents[doc["id"]] = {"path": str(path), "kind": doc.get("kind"), "hash": digest,
-                                "hash_history": history, "missing": False, "last_checked": now()}
+                                "hash_history": history, "missing": False, "last_checked": now(),
+                                "last_analyzed_hash": previous.get("last_analyzed_hash"),
+                                "last_analyzed_at": previous.get("last_analyzed_at")}
     DOCUMENT_STATE.write_text(json.dumps(state, indent=2) + "\n")
     return state
 
@@ -155,7 +157,11 @@ def record_fact_provenance(config: dict, document_state: dict) -> None:
             body_hash = sha256_text(canonical(body))
             key = f"{doc['id']}:{name}:{body_hash}"
             derived = [{"document": doc["id"], "hash": source["hash"]}]
-            derived.extend({"document": item[0], "hash": item[1]} for item in DERIVED_FROM.findall(body))
+            for source_id, source_hash in DERIVED_FROM.findall(body):
+                candidate = hashes.get(source_id, {})
+                known = [item.get("hash") for item in candidate.get("hash_history", [])]
+                if source_hash in known:
+                    derived.append({"document": source_id, "hash": source_hash})
             previous = facts.get(key, {})
             facts[key] = {"name": name, "document": doc["id"], "fact_hash": body_hash,
                           "sources": derived, "first_seen": previous.get("first_seen", now()),
@@ -227,6 +233,29 @@ def validate_text(text: str, label: str) -> list[str]:
         if SECRET.search(part):
             problems.append(f"{label}: possible secret in <common>; move it outside the shared scope")
     return problems
+
+
+def validate_provenance(config: dict, document_state: dict) -> list[str]:
+    problems = []
+    documents = document_state.get("documents", {})
+    for doc in config["documents"]:
+        path = doc_path(doc)
+        if not path.exists():
+            continue
+        for source_id, source_hash in DERIVED_FROM.findall(path.read_text()):
+            candidate = documents.get(source_id, {})
+            known = [item.get("hash") for item in candidate.get("hash_history", [])]
+            if source_hash not in known:
+                problems.append(f"{doc['id']}: derived-from references unknown hash for {source_id}")
+    return problems
+
+
+def validate_remote_part(part: object, label: str) -> list[str]:
+    if not isinstance(part, str):
+        return [f"{label}: common fragment must be text"]
+    if "<common>" in part or "</common>" in part or SCOPE.search(part):
+        return [f"{label}: remote fragment may not contain scope tags"]
+    return validate_text(f"<common>\n{part}\n</common>", label)
 
 
 def snapshot(config: dict, reason: str) -> str:
@@ -428,6 +457,7 @@ def check(config: dict, kind: str | None = None) -> None:
             problems.append(f"{doc['id']}: missing {path}")
         else:
             problems += validate_text(path.read_text(), doc["id"])
+    problems += validate_provenance(config, document_state)
     if problems:
         print("CHECK FAILED", file=sys.stderr)
         print("\n".join(f"- {p}" for p in problems), file=sys.stderr)
@@ -580,17 +610,31 @@ def sync(config: dict, peer_name: str, kind: str | None = None, pull: bool = Fal
 
 
 def merge(config: dict, bundle_path: Path, kind: str | None = None) -> None:
-    bundle = json.loads(bundle_path.read_text())
-    if bundle.get("format") != 1 or not isinstance(bundle.get("machine"), str):
+    try:
+        bundle = json.loads(bundle_path.read_text())
+    except (OSError, json.JSONDecodeError) as exc:
+        raise SystemExit(f"Malformed bundle: {exc}") from exc
+    if not isinstance(bundle, dict) or bundle.get("format") != 1 or not isinstance(bundle.get("machine"), str):
         raise SystemExit("Unsupported or malformed bundle")
+    if not isinstance(bundle.get("documents"), list):
+        raise SystemExit("Malformed bundle documents")
     if bundle["machine"] == config["machine"]:
         raise SystemExit("Refusing to merge a bundle exported by this same machine")
     config = scoped_config(config, kind)
     by_id = {doc["id"]: doc for doc in config["documents"]}
     changes = []
-    for incoming in bundle.get("documents", []):
+    received_ids = set()
+    for incoming in bundle["documents"]:
+        if not isinstance(incoming, dict) or not isinstance(incoming.get("id"), str) or not isinstance(incoming.get("common"), list):
+            raise SystemExit("Malformed bundle document")
+        if incoming["id"] in received_ids:
+            raise SystemExit(f"Malformed bundle: duplicate document id {incoming['id']}")
+        received_ids.add(incoming["id"])
+        expected_hash = hashlib.sha256("\n\n".join(incoming["common"]).encode()).hexdigest() if all(isinstance(x, str) for x in incoming["common"]) else None
+        if incoming.get("sha256") != expected_hash:
+            raise SystemExit(f"Malformed bundle: invalid hash for {incoming['id']}")
         doc = by_id.get(incoming.get("id"))
-        if not doc or not isinstance(incoming.get("common"), list):
+        if not doc:
             continue
         path = doc_path(doc)
         if not path.exists():
@@ -598,20 +642,25 @@ def merge(config: dict, bundle_path: Path, kind: str | None = None) -> None:
         existing = path.read_text()
         problems = validate_text(existing, doc["id"])
         for part in incoming["common"]:
-            problems += validate_text(f"<common>\n{part}\n</common>", f"remote {doc['id']}")
+            problems += validate_remote_part(part, f"remote {doc['id']}")
         if problems:
             raise SystemExit("Merge refused:\n" + "\n".join(problems))
         local_parts = common_parts(existing)
         local_facts = {name: body for part in local_parts for name, body in FACT.findall(part)}
         additions = []
+        remote_facts_seen = {}
         for part in incoming["common"]:
             remote_facts = FACT.findall(part)
             if remote_facts:
                 for name, body in remote_facts:
-                    if name not in local_facts:
-                        additions.append(part.strip())
+                    prior = remote_facts_seen.get(name)
+                    if prior is not None and canonical(prior) != canonical(body):
+                        additions.append(conflict(name, prior, body, bundle["machine"]))
+                    elif name not in local_facts:
+                        additions.append(f'<!-- knowledge-sync:fact name="{name}" -->\n{body}\n<!-- /knowledge-sync:fact -->')
                     elif canonical(local_facts[name]) != canonical(body):
                         additions.append(conflict(name, local_facts[name], body, bundle["machine"]))
+                    remote_facts_seen[name] = body
                 continue
             if canonical(part) not in {canonical(p) for p in local_parts}:
                 additions.append(part.strip())
