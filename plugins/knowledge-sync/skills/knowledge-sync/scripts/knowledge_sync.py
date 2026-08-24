@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import argparse
-import datetime as dt
 import hashlib
 import json
 import re
@@ -14,17 +13,13 @@ import sys
 import socket
 from pathlib import Path
 from collections import Counter
+from knowledge_sync_state import (
+    CLAUDE_HOME, CONFIG, DOCUMENT_STATE, ENVIRONMENT, FACT_PROVENANCE, LOG,
+    MACHINE_FACTS, STATE, SYNC_STATE, doc_path, load_config, log,
+    native_documents, now, read_json, refresh_documents, write_config,
+)
 
-STATE = Path(".knowledge-sync")
-CONFIG = STATE / "config.json"
-LOG = STATE / "log.jsonl"
-ENVIRONMENT = STATE / "environment.json"
-MACHINE_FACTS = STATE / "machine-facts.json"
-SYNC_STATE = STATE / "sync-state.json"
-DOCUMENT_STATE = STATE / "document-state.json"
-FACT_PROVENANCE = STATE / "fact-provenance.json"
-REMOTE_SCRIPT = ".knowledge-sync/bin/knowledge_sync.py"
-DEFAULT_REMOTE_WORKSPACE = ".claude-knowledge-sync"
+REMOTE_SCRIPT = ".claude/knowledge-sync/bin/knowledge_sync.py"
 FACT = re.compile(r'<!-- knowledge-sync:fact name="([^"]+)" -->\s*(.*?)\s*<!-- /knowledge-sync:fact -->', re.S)
 COMMON = re.compile(r"<common>\s*(.*?)\s*</common>", re.S)
 SCOPE = re.compile(r"<([A-Za-z][A-Za-z0-9_-]*)>\s*(.*?)\s*</\1>", re.S)
@@ -37,61 +32,8 @@ DEFAULT_TOOL_CANDIDATES = [
 SHELL_OPERATORS = {"|", "||", "&&", ";", "&", "("}
 
 
-def now() -> str:
-    return dt.datetime.now(dt.timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
-
-
-def load_config() -> dict:
-    if not CONFIG.exists():
-        raise SystemExit("No .knowledge-sync/config.json. Run init first.")
-    try:
-        config = json.loads(CONFIG.read_text())
-    except json.JSONDecodeError as exc:
-        raise SystemExit(f"Invalid config: {exc}") from exc
-    if not isinstance(config.get("machine"), str) or not config["machine"]:
-        raise SystemExit("config.machine must be a non-empty string")
-    docs = config.get("documents")
-    if not isinstance(docs, list) or not docs:
-        raise SystemExit("config.documents must be a non-empty list")
-    for doc in docs:
-        path = Path(doc.get("path", ""))
-        if not isinstance(doc.get("id"), str) or path.is_absolute() or ".." in path.parts:
-            raise SystemExit("Every document needs an id and a workspace-relative path without '..'")
-    for peer in config.get("peers", []):
-        if not all(isinstance(peer.get(key), str) and peer[key] for key in ("name", "ssh_target")):
-            raise SystemExit("Every peer needs non-empty name and ssh_target fields")
-        peer.setdefault("workspace", DEFAULT_REMOTE_WORKSPACE)
-    return config
-
-
-def log(event: str, **data: object) -> None:
-    STATE.mkdir(exist_ok=True)
-    with LOG.open("a") as stream:
-        stream.write(json.dumps({"time": now(), "event": event, **data}, sort_keys=True) + "\n")
-
-
-def doc_path(doc: dict) -> Path:
-    return Path(doc["path"])
-
-
 def ensure_documents(config: dict) -> None:
-    """Create safe empty templates for missing configured documents only."""
-    for doc in config["documents"]:
-        path = doc_path(doc)
-        if path.exists():
-            continue
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(
-            f"# {doc['kind'].title()}\n\n"
-            f"<{config['machine']}>\n"
-            "<!-- Add machine-specific facts here with knowledge-sync:fact markers. -->\n"
-            f"</{config['machine']}>\n"
-        )
-        log("document_scaffolded", document=doc["id"], path=str(path))
-
-
-def write_config(config: dict) -> None:
-    CONFIG.write_text(json.dumps(config, indent=2) + "\n")
+    """Kept for compatibility: native Claude documents are never scaffolded."""
 
 
 def scoped_config(config: dict, kind: str | None) -> dict:
@@ -103,13 +45,6 @@ def scoped_config(config: dict, kind: str | None) -> dict:
     if not selected:
         raise SystemExit(f"No configured document has kind: {kind}")
     return {**config, "documents": selected}
-
-
-def read_json(path: Path, fallback: dict) -> dict:
-    try:
-        return json.loads(path.read_text()) if path.exists() else fallback
-    except json.JSONDecodeError:
-        return fallback
 
 
 def sha256_text(text: str) -> str:
@@ -153,6 +88,10 @@ def record_fact_provenance(config: dict, document_state: dict) -> None:
         if source.get("missing") or not source.get("hash"):
             continue
         text = doc_path(doc).read_text()
+        scoped_facts = {}
+        for scope, content in SCOPE.findall(text):
+            for scoped_name, scoped_body in FACT.findall(content):
+                scoped_facts[(scoped_name, canonical(scoped_body))] = "shared" if scope == "common" else scope
         for name, body in FACT.findall(text):
             body_hash = sha256_text(canonical(body))
             key = f"{doc['id']}:{name}:{body_hash}"
@@ -164,6 +103,7 @@ def record_fact_provenance(config: dict, document_state: dict) -> None:
                     derived.append({"document": source_id, "hash": source_hash})
             previous = facts.get(key, {})
             facts[key] = {"name": name, "document": doc["id"], "fact_hash": body_hash,
+                          "scope": scoped_facts.get((name, canonical(body)), doc.get("scope", doc.get("kind"))),
                           "sources": derived, "first_seen": previous.get("first_seen", now()),
                           "last_seen": now(), "active": True}
             active.add(key)
@@ -175,7 +115,7 @@ def record_fact_provenance(config: dict, document_state: dict) -> None:
 
 
 def record_machine_facts(config: dict) -> None:
-    """Record explicitly tagged non-common facts locally; never remove history."""
+    """Record tagged facts with the scope implied by their native source file."""
     state = read_json(MACHINE_FACTS, {"format": 1, "machine": config["machine"], "facts": {}})
     state["machine"] = config["machine"]
     facts = state.setdefault("facts", {})
@@ -186,19 +126,24 @@ def record_machine_facts(config: dict) -> None:
         path = doc_path(doc)
         if not path.exists():
             continue
-        for scope, content in SCOPE.findall(path.read_text()):
-            if scope == "common":
-                continue
+        text = path.read_text()
+        explicit_scopes = {}
+        for scope, content in SCOPE.findall(text):
             for name, body in FACT.findall(content):
-                key = f"{doc['id']}:{scope}:{name}"
-                digest = hashlib.sha256(canonical(body).encode()).hexdigest()
-                previous = facts.get(key, {})
-                facts[key] = {
-                    "name": name, "document": doc["id"], "scope": scope,
-                    "digest": digest, "first_seen": previous.get("first_seen", now()),
-                    "last_seen": now(), "active": True,
-                }
-                seen.add(key)
+                explicit_scopes[(name, canonical(body))] = "shared" if scope == "common" else scope
+        for name, body in FACT.findall(text):
+            scope = explicit_scopes.get((name, canonical(body)), doc.get("scope", doc.get("kind", "local")))
+            if scope == "shared":
+                continue
+            key = f"{doc['id']}:{scope}:{name}"
+            digest = hashlib.sha256(canonical(body).encode()).hexdigest()
+            previous = facts.get(key, {})
+            facts[key] = {
+                "name": name, "document": doc["id"], "scope": scope,
+                "digest": digest, "first_seen": previous.get("first_seen", now()),
+                "last_seen": now(), "active": True,
+            }
+            seen.add(key)
     for key, value in facts.items():
         if key.split(":", 1)[0] in processed_ids and key not in seen:
             value["active"] = False
@@ -288,13 +233,10 @@ def conflict(name: str, local: str, remote: str, source: str) -> str:
 def init(args: argparse.Namespace) -> None:
     if CONFIG.exists():
         raise SystemExit("Refusing to overwrite existing configuration")
-    STATE.mkdir(exist_ok=True)
+    STATE.mkdir(parents=True, exist_ok=True)
     write_config({
         "machine": args.machine,
-        "documents": [
-            {"id": "memory", "path": ".claude/memory.md", "kind": "memory"},
-            {"id": "steering", "path": "CLAUDE.md", "kind": "steering"}
-        ],
+        "documents": native_documents(),
         "peers": [],
         # This section and environment.json are intentionally local-only.  They
         # are never put in an export bundle.
@@ -305,11 +247,10 @@ def init(args: argparse.Namespace) -> None:
         },
     })
     log("initialized", machine=args.machine)
-    ensure_documents(load_config())
     scan_document_state(load_config())
     if not args.no_discover_environment:
         discover_environment(load_config())
-    print(f"Created {CONFIG}; edit document paths and peers before syncing.")
+    print(f"Created {CONFIG}; discovered {len(load_config()['documents'])} native Claude documents.")
 
 
 def provision(args: argparse.Namespace) -> None:
@@ -318,7 +259,8 @@ def provision(args: argparse.Namespace) -> None:
     else:
         init(argparse.Namespace(machine=args.machine, no_discover_environment=args.no_discover_environment))
         config = load_config()
-    ensure_documents(config)
+    refresh_documents(config)
+    config = load_config()
     document_state = scan_document_state(config)
     record_machine_facts(config)
     record_fact_provenance(config, document_state)
@@ -434,7 +376,7 @@ def discover_environment(config: dict) -> None:
             for tool in all_tools
         ],
     }
-    STATE.mkdir(exist_ok=True)
+    STATE.mkdir(parents=True, exist_ok=True)
     if ENVIRONMENT.exists():
         # Environment data is local state, but preserve it with the same
         # non-destructive discipline as the synchronised documents.
@@ -499,11 +441,7 @@ def shell_join(parts: list[str]) -> str:
 
 
 def remote_command(peer: dict, script: str, *arguments: str) -> list[str]:
-    command = "cd %s && python3 %s %s" % (
-        shlex.quote(peer["workspace"]),
-        shlex.quote(REMOTE_SCRIPT),
-        shell_join(list(arguments)),
-    )
+    command = "python3 \"$HOME/%s\" %s" % (REMOTE_SCRIPT, shell_join(list(arguments)))
     # Do not rely on the account's login shell: it may be nushell, fish, etc.
     remote = "sh -lc " + shlex.quote(command)
     return ["ssh", peer["ssh_target"], remote]
@@ -519,30 +457,29 @@ def verify_peer(peer: dict) -> None:
 
 
 def provision_peer(peer: dict, machine: str) -> None:
-    """Install only this script and scaffold its isolated remote workspace."""
-    workspace = peer.get("workspace", DEFAULT_REMOTE_WORKSPACE)
-    run(remote_shell(peer, "mkdir -p " + shlex.quote(f"{workspace}/.knowledge-sync/bin")))
-    run(["rsync", "-az", "-e", "ssh", str(Path(__file__).resolve()),
-         f"{peer['ssh_target']}:{workspace}/{REMOTE_SCRIPT}"])
+    """Install the helper under the peer's native ~/.claude directory."""
+    run(remote_shell(peer, "mkdir -p \"$HOME/.claude/knowledge-sync/bin\""))
+    for helper in ("knowledge_sync.py", "knowledge_sync_state.py"):
+        run(["rsync", "-az", "-e", "ssh", str(Path(__file__).with_name(helper)),
+             f"{peer['ssh_target']}:.claude/knowledge-sync/bin/{helper}"])
     run(remote_command(peer, "knowledge_sync.py", "provision", "--machine", machine,
                        "--no-discover-environment"))
 
 
-def add_peer(config: dict, name: str, ssh_target: str, workspace: str | None) -> None:
-    peer = {"name": name, "ssh_target": ssh_target,
-            "workspace": workspace or DEFAULT_REMOTE_WORKSPACE}
+def add_peer(config: dict, name: str, ssh_target: str) -> None:
+    peer = {"name": name, "ssh_target": ssh_target}
     verify_peer(peer)
     peers = [item for item in config.get("peers", []) if item.get("name") != name]
     peers.append(peer)
     config["peers"] = peers
     write_config(config)
-    log("peer_added", name=name, ssh_target=ssh_target, workspace=peer["workspace"])
+    log("peer_added", name=name, ssh_target=ssh_target)
     record_sync_state(config, "peer_added", name=name)
     print(f"Registered and verified peer {name}.")
 
 
 def add_peer_command(config: dict, args: argparse.Namespace) -> None:
-    add_peer(config, args.name, args.ssh_target, args.workspace)
+    add_peer(config, args.name, args.ssh_target)
 
 
 def pair(args: argparse.Namespace) -> None:
@@ -550,9 +487,10 @@ def pair(args: argparse.Namespace) -> None:
     if not CONFIG.exists():
         init(argparse.Namespace(machine=local_machine, no_discover_environment=False))
     config = load_config()
-    remote_workspace = args.workspace or DEFAULT_REMOTE_WORKSPACE
+    refresh_documents(config)
+    config = load_config()
     remote_name = args.name or output(["ssh", args.ssh_target, "hostname -s"])
-    peer = {"name": remote_name, "ssh_target": args.ssh_target, "workspace": remote_workspace}
+    peer = {"name": remote_name, "ssh_target": args.ssh_target}
     verify_peer(peer)
     # Do not register either peer until the remote helper and documents exist.
     provision_peer(peer, remote_name)
@@ -560,9 +498,9 @@ def pair(args: argparse.Namespace) -> None:
         if not args.local_ssh_target:
             raise SystemExit("--register-reverse requires --local-ssh-target")
         reverse_args = ["add-peer", "--name", config["machine"], "--ssh-target",
-                        args.local_ssh_target, "--workspace", str(Path.cwd().resolve())]
+                        args.local_ssh_target]
         run(remote_command(peer, "knowledge_sync.py", *reverse_args))
-    add_peer(config, remote_name, args.ssh_target, remote_workspace)
+    add_peer(config, remote_name, args.ssh_target)
     print(f"Paired {config['machine']} with {remote_name}.")
 
 
@@ -576,7 +514,7 @@ def sync(config: dict, peer_name: str, kind: str | None = None, pull: bool = Fal
     remote_check_args = ["check"] + (["--kind", kind] if kind else [])
     run(remote_command(peer, "knowledge_sync.py", *remote_check_args))
     stamp = now()
-    remote_outbox = f"{peer['workspace']}/.knowledge-sync/outbound/{config['machine']}"
+    remote_outbox = f".claude/knowledge-sync/outbound/{config['machine']}"
     remote_return = f"{remote_outbox}/{stamp}.json"
     inbound = STATE / "inbox" / peer_name / f"{stamp}.json"
     if pull:
@@ -592,7 +530,7 @@ def sync(config: dict, peer_name: str, kind: str | None = None, pull: bool = Fal
         return
     outbound = STATE / "outbound" / peer_name / f"{stamp}.json"
     export(config, outbound)
-    remote_inbox = f"{peer['workspace']}/.knowledge-sync/inbox/{config['machine']}"
+    remote_inbox = f".claude/knowledge-sync/inbox/{config['machine']}"
     remote_bundle = f"{remote_inbox}/{stamp}.json"
     run(remote_shell(peer, "mkdir -p " + shlex.quote(remote_inbox)))
     run(["rsync", "-az", "-e", "ssh", str(outbound), f"{peer['ssh_target']}:{remote_bundle}"])
@@ -747,8 +685,8 @@ def main() -> None:
     sub = parser.add_subparsers(dest="command", required=True)
     p = sub.add_parser("init"); p.add_argument("--machine", required=True); p.add_argument("--no-discover-environment", action="store_true")
     p = sub.add_parser("provision"); p.add_argument("--machine", required=True); p.add_argument("--no-discover-environment", action="store_true")
-    p = sub.add_parser("add-peer"); p.add_argument("--name", required=True); p.add_argument("--ssh-target", required=True); p.add_argument("--workspace")
-    p = sub.add_parser("pair"); p.add_argument("--ssh-target", required=True); p.add_argument("--workspace"); p.add_argument("--name"); p.add_argument("--machine"); p.add_argument("--register-reverse", action="store_true"); p.add_argument("--local-ssh-target")
+    p = sub.add_parser("add-peer"); p.add_argument("--name", required=True); p.add_argument("--ssh-target", required=True)
+    p = sub.add_parser("pair"); p.add_argument("--ssh-target", required=True); p.add_argument("--name"); p.add_argument("--machine"); p.add_argument("--register-reverse", action="store_true"); p.add_argument("--local-ssh-target")
     sub.add_parser("discover-environment")
     sub.add_parser("record-machine-facts")
     sub.add_parser("analysis-status")

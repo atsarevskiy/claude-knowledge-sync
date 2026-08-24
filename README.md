@@ -1,33 +1,27 @@
 # Claude Knowledge Sync
 
-An environment-aware Claude Code skill for synchronizing and merging memories and steering documents across machines.
-
-The skill shares only explicitly marked portable knowledge, preserves machine-specific workflows and tool profiles, records every merge, snapshots files before changes, and retains both versions of conflicting facts.
+An environment-aware Claude Code skill that synchronizes and non-destructively merges knowledge across machines. It uses Claude Code's actual memory and instruction files, shares explicitly portable facts, preserves conflicts, and keeps snapshots, audit logs, and classification history.
 
 ## Install from the Claude Code marketplace
-
-After this repository is pushed to GitHub, add its marketplace and install the plugin:
 
 ```bash
 claude plugin marketplace add atsarevskiy/claude-knowledge-sync
 claude plugin install knowledge-sync@claude-knowledge-sync
 ```
 
-For local development, replace `atsarevskiy/claude-knowledge-sync` with the local repository path in the marketplace-add command.
+## Native Claude Code documents
 
-## Initialize and sync
+Knowledge Sync does not create a competing memory or steering document. It discovers existing Markdown files in:
 
-On each machine, open the target workspace in Claude Code and invoke `/knowledge-sync:knowledge-sync` to configure the local machine. Initialization scaffolds missing `.claude/memory.md` and `CLAUDE.md` with safe local and shared sections, so `check` succeeds immediately.
+- `~/.claude/CLAUDE.md` and `~/.claude/rules/**/*.md` for user steering;
+- `~/.claude/memory/**/*.md`, if a user maintains that location;
+- `~/.claude/projects/<project>/memory/**/*.md`, including Claude Code's `MEMORY.md` entrypoint and topic files.
 
-Configure the local `.knowledge-sync/config.json` with equivalent document IDs and an SSH peer, then run:
+Only `~/.claude/knowledge-sync/` is created, for this plugin's metadata. `init` is valid even when no native document exists. When a document is later discovered, it is added to the configuration; when one disappears, it is reported as missing rather than recreated or removed.
 
-Run the sync command from the skill after configuring the peer.
+## Portable and local facts
 
-The sync workflow uses `rsync -az -e ssh` to exchange filtered bundles in both directions; it never transfers full documents, configuration, logs, snapshots, or local environment profiles.
-
-## Shared versus local knowledge
-
-Only `<common>` blocks are shared:
+Native files remain normal Markdown. Make a fact portable only with an explicit `<common>` block:
 
 ```markdown
 <common>
@@ -35,42 +29,25 @@ Only `<common>` blocks are shared:
 Run focused tests before the full suite.
 <!-- /knowledge-sync:fact -->
 </common>
-
-<A>
-The local proxy listens on port 4318.
-</A>
 ```
 
-See [the plugin skill](plugins/knowledge-sync/skills/knowledge-sync/SKILL.md) for operating instructions and [the protocol](plugins/knowledge-sync/skills/knowledge-sync/references/protocol.md) for the merge protocol.
+Everything else remains local. Mining derives a fact's default scope from the file in which it already lives (`project-memory`, `user-memory`, `user-steering`, or `user-rule`) and records its source document hash. It never moves, replaces, or erases existing memory.
 
-## Commands
-
-- `/knowledge-sync:memory B` syncs only memories with peer `B`.
-- `/knowledge-sync:steering B` syncs only steering documents with peer `B`.
-- Add `--pull` to either command, or to `sync --peer B --pull`, to fetch and merge the peer's shared knowledge without sending local knowledge back.
-
-The plugin defaults to both configured memory and steering documents when no kind is selected.
-
-## Peer and pair bootstrap
-
-Register an existing peer and verify that Python and rsync are reachable over SSH:
+## Bootstrap and sync
 
 ```bash
-knowledge_sync.py add-peer --name B --ssh-target you@host --workspace /path/to/workspace
+knowledge_sync.py init --machine A
+knowledge_sync.py add-peer --name B --ssh-target you@host
+# Or provision the remote helper and add the peer in one direction:
+knowledge_sync.py pair --ssh-target you@host
 ```
 
-`--workspace` is optional. Without it, the plugin uses `.claude-knowledge-sync` in the remote account's home directory. Specify it when the peer's knowledge should live in a particular repository: SSH cannot otherwise know which remote project owns `CLAUDE.md`.
+`pair` copies only the helper and creates its `~/.claude/knowledge-sync/` metadata directory remotely. It discovers the remote machine's existing native documents; it never scaffolds empty memory or `CLAUDE.md` files. Reverse registration is optional and needs an explicit reachable local SSH target.
 
-For first-time setup, use `pair`. It initializes the local workspace if needed, copies the sync script to the peer, scaffolds its documents and local state, then registers the remote peer locally:
+The exchange uses `rsync -az -e ssh` for filtered bundles and SSH to run the helper. Full documents, configuration, logs, snapshots, environment profiles, and local-only sections are never transferred.
 
-```bash
-knowledge_sync.py pair --ssh-target you@host --workspace /path/to/workspace
-```
+- `/knowledge-sync:memory B` syncs discovered memories.
+- `/knowledge-sync:steering B` syncs discovered steering files.
+- Add `--pull` for one-way receive-and-merge.
 
-This is sufficient for normal two-way sync started from the local machine: one sync exchanges knowledge in both directions. Reverse registration is optional and only needed when you want to initiate sync from the remote machine too. Enable it explicitly with `--register-reverse --local-ssh-target user@reachable-local-host`; no local hostname is guessed.
-
-Pair does not write a local peer entry until remote provisioning succeeds. Remote provisioning itself cannot be globally atomic across two independent machines, but it is idempotent and safe to rerun after an interruption.
-
-Each machine also keeps local-only `.knowledge-sync/machine-facts.json` and `.knowledge-sync/sync-state.json` files. They remember environment-specific decisions and that machine's sync history, so the skill does not repeatedly rediscover a fact already classified as local.
-
-Use `/knowledge-sync:mine-facts` to have Claude analyze documents whose hashes changed since the last analysis. It creates sourced fact entries, records document and fact provenance in `.knowledge-sync/document-state.json` and `.knowledge-sync/fact-provenance.json`, and warns when a previously tracked document disappears without deleting anything.
+With no kind option, both are selected. See [the skill](plugins/knowledge-sync/skills/knowledge-sync/SKILL.md) and [protocol](plugins/knowledge-sync/skills/knowledge-sync/references/protocol.md).
