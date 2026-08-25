@@ -15,6 +15,8 @@ Analyze every document whose hash differs from `last_analyzed_hash`; if `$ARGUME
 
 First classify existing per-fact memory files from frontmatter `metadata.scope`: `common` is portable and every other label is machine-local. Do not apply inline tags to these files. For free-form steering documents, classify only explicit `<common>` blocks as portable. Ignore `MEMORY.md`; it is a generated local index. Consult `~/.claude/knowledge-sync/machine-facts.json` and `fact-provenance.json`; keep a prior local classification instead of proposing the same fact again.
 
+For every **new candidate fact**, explicitly apply this question before choosing its scope: **“Does this depend on tools, paths, credentials, services, configuration, or access that exist only on this one machine?”** Mark it machine-local only when the answer is clearly yes from the source or user context. A generic tool reference is not enough: `git`, `node`, `python`, `kubectl`, a test runner, or any other tool may be shared when it is available on both machines. If the only reason to exclude a fact is a tool name, classify it as a `common` candidate instead of skipping it. Preserve the secret check: secrets must never become common.
+
 Only when a genuinely new durable fact is worth recording, add it to the most relevant **existing** native document. Before that edit, create a snapshot with reason `before fact mining`. Never create a substitute memory file, empty `MEMORY.md`, empty `CLAUDE.md`, or empty `<common>` section.
 
 Add only concise, durable facts. Use this format:
@@ -26,4 +28,4 @@ Fact text.
 <!-- /knowledge-sync:fact -->
 ```
 
-Each derived fact must cite every document hash materially used to derive it. Set a new per-fact file's `metadata.scope: common` only when it is portable, contains no secret or machine-local detail, and will help peers; otherwise retain its existing machine label. Use `<common>` only in free-form steering. Never remove or rewrite an existing fact or source record. After edits, run `check`, then `mark-analyzed`, and report the classifications, any added facts, their source documents, portable classifications, and missing documents.
+Each derived fact must cite every document hash materially used to derive it. Set a new per-fact file's `metadata.scope: common` when that dependency question is not clearly yes, the fact has no secret, and it will help peers; otherwise use the existing machine label. Use `<common>` only in free-form steering. Never remove or rewrite an existing fact or source record. After edits, run `check`, then `mark-analyzed`, and report the classifications, the answer to the dependency question for each new fact, any added facts, their source documents, portable classifications, and missing documents.
