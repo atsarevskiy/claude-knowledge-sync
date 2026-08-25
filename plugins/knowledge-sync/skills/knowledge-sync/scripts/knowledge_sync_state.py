@@ -4,6 +4,7 @@ from __future__ import annotations
 import datetime as dt
 import hashlib
 import json
+import re
 from pathlib import Path
 
 CLAUDE_HOME = Path.home() / ".claude"
@@ -33,6 +34,28 @@ def doc_path(doc: dict) -> Path:
     return Path(doc["path"]).expanduser()
 
 
+def is_memory_index(path: Path) -> bool:
+    """Claude manages MEMORY.md as an index; it is never a sync source."""
+    return path.name.lower() == "memory.md" and path.parent.name == "memory"
+
+
+def frontmatter_scope(text: str) -> str | None:
+    """Read the small YAML subset used by Claude fact files: metadata.scope."""
+    if not text.startswith("---\n") and not text.startswith("---\r\n"):
+        return None
+    lines = text.splitlines()
+    try:
+        end = next(index for index, line in enumerate(lines[1:], 1) if line.strip() in {"---", "..."})
+    except StopIteration:
+        return None
+    frontmatter = "\n".join(lines[1:end])
+    metadata = re.search(r"(?ms)^metadata\s*:\s*\n((?:^[ \t]+.*(?:\n|$))*)", frontmatter)
+    if not metadata:
+        return None
+    scope = re.search(r"(?m)^[ \t]+scope\s*:\s*['\"]?([A-Za-z][A-Za-z0-9_-]*)['\"]?\s*(?:#.*)?$", metadata.group(1))
+    return scope.group(1) if scope else None
+
+
 def native_documents() -> list[dict]:
     """Discover existing Claude Code memory and instruction Markdown files."""
     candidates = [(CLAUDE_HOME / "CLAUDE.md", "steering", "user-steering")]
@@ -47,11 +70,17 @@ def native_documents() -> list[dict]:
         candidates.extend((path, kind, scope) for path in folder.glob(pattern))
     found = []
     for path, kind, scope in candidates:
-        if not path.is_file():
+        if not path.is_file() or is_memory_index(path):
             continue
         relative = str(path.relative_to(CLAUDE_HOME))
-        found.append({"id": hashlib.sha256(relative.encode()).hexdigest()[:16],
-                      "path": str(path), "kind": kind, "scope": scope})
+        document = {"id": hashlib.sha256(relative.encode()).hexdigest()[:16],
+                    "path": str(path), "kind": kind, "scope": scope}
+        if kind == "memory":
+            document["mode"] = "fact-file"
+            document["frontmatter_scope"] = frontmatter_scope(path.read_text(errors="replace"))
+        else:
+            document["mode"] = "free-form"
+        found.append(document)
     return sorted(found, key=lambda item: item["path"])
 
 
@@ -84,6 +113,10 @@ def load_config() -> dict:
 def refresh_documents(config: dict) -> None:
     """Add documents found now but retain historical entries for disappearance alerts."""
     current = {item["id"]: item for item in config.get("documents", [])}
+    for item in current.values():
+        if is_memory_index(doc_path(item)):
+            item["generated_index"] = True
+            item["syncable"] = False
     for doc in native_documents():
         current[doc["id"]] = doc
     config["documents"] = list(current.values())

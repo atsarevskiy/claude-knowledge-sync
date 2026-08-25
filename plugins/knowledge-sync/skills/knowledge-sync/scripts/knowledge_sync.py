@@ -16,7 +16,8 @@ from collections import Counter
 from knowledge_sync_state import (
     CLAUDE_HOME, CONFIG, DOCUMENT_STATE, ENVIRONMENT, FACT_PROVENANCE, LOG,
     MACHINE_FACTS, STATE, SYNC_STATE, doc_path, load_config, log,
-    native_documents, now, read_json, refresh_documents, write_config,
+    frontmatter_scope, is_memory_index, is_under, native_documents, now, read_json,
+    refresh_documents, write_config,
 )
 
 REMOTE_SCRIPT = ".claude/knowledge-sync/bin/knowledge_sync.py"
@@ -37,18 +38,57 @@ def ensure_documents(config: dict) -> None:
 
 
 def scoped_config(config: dict, kind: str | None) -> dict:
-    if kind is None:
-        return config
-    if kind not in {"memory", "steering"}:
+    if kind is not None and kind not in {"memory", "steering"}:
         raise SystemExit("--kind must be memory or steering")
-    selected = [doc for doc in config["documents"] if doc.get("kind") == kind]
-    if not selected:
+    selected = [doc for doc in config["documents"]
+                if doc.get("syncable", True) and not doc.get("generated_index")
+                and (kind is None or doc.get("kind") == kind)]
+    if kind is not None and not selected:
         raise SystemExit(f"No configured document has kind: {kind}")
     return {**config, "documents": selected}
 
 
 def sha256_text(text: str) -> str:
     return hashlib.sha256(text.encode()).hexdigest()
+
+
+def document_mode(doc: dict) -> str:
+    return doc.get("mode", "fact-file" if doc.get("kind") == "memory" else "free-form")
+
+
+def fact_file_body(text: str) -> str:
+    lines = text.splitlines()
+    if lines and lines[0].strip() == "---":
+        for index, line in enumerate(lines[1:], 1):
+            if line.strip() in {"---", "..."}:
+                return "\n".join(lines[index + 1:]).strip()
+    return text.strip()
+
+
+def document_facts(doc: dict, text: str) -> list[tuple[str, str]]:
+    """A per-fact memory file is itself one fact; free-form files use markers."""
+    if document_mode(doc) == "fact-file":
+        body = fact_file_body(text)
+        return [(doc_path(doc).stem, body)] if body else []
+    return FACT.findall(text)
+
+
+def shareable_parts(doc: dict, text: str) -> list[str]:
+    """Return exportable content according to native file format and scope."""
+    if document_mode(doc) == "fact-file":
+        return [text] if doc.get("frontmatter_scope") == "common" else []
+    return common_parts(text)
+
+
+def validate_document(doc: dict, text: str, label: str) -> list[str]:
+    if document_mode(doc) != "fact-file":
+        return validate_text(text, label)
+    actual_scope = frontmatter_scope(text)
+    if actual_scope != doc.get("frontmatter_scope"):
+        return [f"{label}: frontmatter metadata.scope changed; rerun provision to refresh discovery"]
+    if actual_scope == "common" and SECRET.search(text):
+        return [f"{label}: possible secret in a shareable fact file"]
+    return []
 
 
 def scan_document_state(config: dict) -> dict:
@@ -92,7 +132,7 @@ def record_fact_provenance(config: dict, document_state: dict) -> None:
         for scope, content in SCOPE.findall(text):
             for scoped_name, scoped_body in FACT.findall(content):
                 scoped_facts[(scoped_name, canonical(scoped_body))] = "shared" if scope == "common" else scope
-        for name, body in FACT.findall(text):
+        for name, body in document_facts(doc, text):
             body_hash = sha256_text(canonical(body))
             key = f"{doc['id']}:{name}:{body_hash}"
             derived = [{"document": doc["id"], "hash": source["hash"]}]
@@ -102,8 +142,11 @@ def record_fact_provenance(config: dict, document_state: dict) -> None:
                 if source_hash in known:
                     derived.append({"document": source_id, "hash": source_hash})
             previous = facts.get(key, {})
+            inferred_scope = ("shared" if document_mode(doc) == "fact-file"
+                              and doc.get("frontmatter_scope") == "common"
+                              else doc.get("scope", doc.get("kind")))
             facts[key] = {"name": name, "document": doc["id"], "fact_hash": body_hash,
-                          "scope": scoped_facts.get((name, canonical(body)), doc.get("scope", doc.get("kind"))),
+                          "scope": scoped_facts.get((name, canonical(body)), inferred_scope),
                           "sources": derived, "first_seen": previous.get("first_seen", now()),
                           "last_seen": now(), "active": True}
             active.add(key)
@@ -131,8 +174,10 @@ def record_machine_facts(config: dict) -> None:
         for scope, content in SCOPE.findall(text):
             for name, body in FACT.findall(content):
                 explicit_scopes[(name, canonical(body))] = "shared" if scope == "common" else scope
-        for name, body in FACT.findall(text):
+        for name, body in document_facts(doc, text):
             scope = explicit_scopes.get((name, canonical(body)), doc.get("scope", doc.get("kind", "local")))
+            if document_mode(doc) == "fact-file" and doc.get("frontmatter_scope") == "common":
+                scope = "shared"
             if scope == "shared":
                 continue
             key = f"{doc['id']}:{scope}:{name}"
@@ -228,6 +273,24 @@ def conflict(name: str, local: str, remote: str, source: str) -> str:
     return ("<!-- knowledge-sync:conflict name=\"%s\" source=\"%s\" -->\n"
             "LOCAL VERSION:\n%s\n\nREMOTE VERSION:\n%s\n"
             "<!-- /knowledge-sync:conflict -->" % (name, source, local, remote))
+
+
+def incoming_fact_document(incoming: dict) -> dict | None:
+    """Accept only a common per-fact file in Claude's native memory folders."""
+    relative = incoming.get("relative_path")
+    if not isinstance(relative, str) or not relative or Path(relative).is_absolute():
+        return None
+    path = CLAUDE_HOME / relative
+    parts = Path(relative).parts
+    allowed = (len(parts) >= 2 and parts[0] == "memory") or (
+        len(parts) >= 4 and parts[0] == "projects" and parts[2] == "memory")
+    expected_id = hashlib.sha256(relative.encode()).hexdigest()[:16]
+    if (not allowed or ".." in parts or is_memory_index(path) or not is_under(path, CLAUDE_HOME)
+            or incoming.get("id") != expected_id):
+        return None
+    return {"id": expected_id, "path": str(path), "kind": "memory", "scope":
+            "user-memory" if parts[0] == "memory" else "project-memory", "mode": "fact-file",
+            "frontmatter_scope": "common"}
 
 
 def init(args: argparse.Namespace) -> None:
@@ -398,7 +461,7 @@ def check(config: dict, kind: str | None = None) -> None:
         if not path.exists():
             problems.append(f"{doc['id']}: missing {path}")
         else:
-            problems += validate_text(path.read_text(), doc["id"])
+            problems += validate_document(doc, path.read_text(), doc["id"])
     problems += validate_provenance(config, document_state)
     if problems:
         print("CHECK FAILED", file=sys.stderr)
@@ -406,7 +469,7 @@ def check(config: dict, kind: str | None = None) -> None:
         raise SystemExit(2)
     record_machine_facts(config)
     record_fact_provenance(config, document_state)
-    print("CHECK OK: only explicit <common> fragments are eligible for export.")
+    print("CHECK OK: only explicit <common> fragments and scope: common fact files are eligible for export.")
 
 
 def export(config: dict, output: Path, kind: str | None = None) -> None:
@@ -414,8 +477,9 @@ def export(config: dict, output: Path, kind: str | None = None) -> None:
     check(config)
     docs = []
     for doc in config["documents"]:
-        parts = common_parts(doc_path(doc).read_text())
-        docs.append({"id": doc["id"], "kind": doc.get("kind"), "common": parts,
+        parts = shareable_parts(doc, doc_path(doc).read_text())
+        docs.append({"id": doc["id"], "kind": doc.get("kind"), "mode": document_mode(doc),
+                     "relative_path": str(doc_path(doc).relative_to(CLAUDE_HOME)), "common": parts,
                      "sha256": hashlib.sha256("\n\n".join(parts).encode()).hexdigest()})
     bundle = {"format": 1, "machine": config["machine"], "created": now(), "documents": docs}
     output.parent.mkdir(parents=True, exist_ok=True)
@@ -558,9 +622,12 @@ def merge(config: dict, bundle_path: Path, kind: str | None = None) -> None:
         raise SystemExit("Malformed bundle documents")
     if bundle["machine"] == config["machine"]:
         raise SystemExit("Refusing to merge a bundle exported by this same machine")
+    all_config = config
     config = scoped_config(config, kind)
     by_id = {doc["id"]: doc for doc in config["documents"]}
     changes = []
+    fact_changes = []
+    discovered = []
     received_ids = set()
     for incoming in bundle["documents"]:
         if not isinstance(incoming, dict) or not isinstance(incoming.get("id"), str) or not isinstance(incoming.get("common"), list):
@@ -571,14 +638,47 @@ def merge(config: dict, bundle_path: Path, kind: str | None = None) -> None:
         expected_hash = hashlib.sha256("\n\n".join(incoming["common"]).encode()).hexdigest() if all(isinstance(x, str) for x in incoming["common"]) else None
         if incoming.get("sha256") != expected_hash:
             raise SystemExit(f"Malformed bundle: invalid hash for {incoming['id']}")
+        if kind is not None and incoming.get("kind") != kind:
+            continue
+        mode = incoming.get("mode", "free-form")
+        if mode not in {"free-form", "fact-file"}:
+            raise SystemExit(f"Malformed bundle: unsupported document mode for {incoming['id']}")
+        if mode == "fact-file" and incoming.get("kind") != "memory":
+            raise SystemExit(f"Malformed fact-file kind for {incoming['id']}")
         doc = by_id.get(incoming.get("id"))
+        if not doc and mode == "fact-file" and incoming["common"]:
+            doc = incoming_fact_document(incoming)
+            if not doc:
+                raise SystemExit(f"Malformed or unsafe fact-file path for {incoming['id']}")
+            by_id[doc["id"]] = doc
+            discovered.append(doc)
         if not doc:
             continue
         path = doc_path(doc)
+        if mode == "fact-file":
+            if len(incoming["common"]) > 1:
+                raise SystemExit(f"Malformed fact-file bundle for {doc['id']}")
+            if not incoming["common"]:
+                continue
+            remote_text = incoming["common"][0]
+            if frontmatter_scope(remote_text) != "common" or SECRET.search(remote_text):
+                raise SystemExit(f"Merge refused: remote {doc['id']} is not a safe scope: common fact file")
+            if not path.exists():
+                fact_changes.append((path, remote_text if remote_text.endswith("\n") else remote_text + "\n",
+                                     doc["id"], "created shared fact file"))
+                continue
+            existing = path.read_text()
+            if frontmatter_scope(existing) != "common":
+                log("merge_fact_file_skipped_local_scope", source=bundle["machine"], document=doc["id"])
+                continue
+            if canonical(existing) != canonical(remote_text):
+                fact_changes.append((path, "\n\n" + conflict(path.stem, existing, remote_text, bundle["machine"]) + "\n",
+                                     doc["id"], "preserved fact-file conflict"))
+            continue
         if not path.exists():
             continue
         existing = path.read_text()
-        problems = validate_text(existing, doc["id"])
+        problems = validate_document(doc, existing, doc["id"])
         for part in incoming["common"]:
             problems += validate_remote_part(part, f"remote {doc['id']}")
         if problems:
@@ -608,15 +708,24 @@ def merge(config: dict, bundle_path: Path, kind: str | None = None) -> None:
                 unique.append(item)
         if unique:
             changes.append((path, "\n\n<common>\n" + "\n\n".join(unique) + "\n</common>\n", doc["id"], len(unique)))
-    if not changes:
+    if not changes and not fact_changes:
         log("merge_noop", source=bundle["machine"], bundle=str(bundle_path))
         print("No new shared knowledge to merge.")
         return
-    snapshot_id = snapshot(config, f"before merge from {bundle['machine']}")
+    snapshot_config = {**config, "documents": config["documents"] + discovered}
+    snapshot_id = snapshot(snapshot_config, f"before merge from {bundle['machine']}")
     for path, addition, doc_id, count in changes:
         with path.open("a") as stream:
             stream.write(addition)
         log("merge", source=bundle["machine"], document=doc_id, additions=count, snapshot=snapshot_id)
+    for path, addition, doc_id, action in fact_changes:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("a" if path.exists() else "w") as stream:
+            stream.write(addition)
+        log("merge_fact_file", source=bundle["machine"], document=doc_id, action=action, snapshot=snapshot_id)
+    if discovered:
+        all_config["documents"].extend(discovered)
+        write_config(all_config)
     record_sync_state(config, "merge", source=bundle["machine"], kind=kind, snapshot=snapshot_id)
     print(f"Merged shared knowledge from {bundle['machine']} after snapshot {snapshot_id}.")
 
@@ -702,6 +811,8 @@ def main() -> None:
     if args.command == "init": return init(args)
     if args.command == "provision": return provision(args)
     if args.command == "pair": return pair(args)
+    config = load_config()
+    refresh_documents(config)
     config = load_config()
     if args.command == "add-peer": return add_peer_command(config, args)
     if args.command == "discover-environment": return discover_environment(config)

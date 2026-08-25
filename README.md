@@ -15,23 +15,25 @@ Knowledge Sync does not create a competing memory or steering document. It disco
 
 - `~/.claude/CLAUDE.md` and `~/.claude/rules/**/*.md` for user steering;
 - `~/.claude/memory/**/*.md`, if a user maintains that location;
-- `~/.claude/projects/<project>/memory/**/*.md`, including Claude Code's `MEMORY.md` entrypoint and topic files.
+- `~/.claude/projects/<project>/memory/*.md` fact files. `MEMORY.md` is a generated local index and is deliberately excluded from sync.
 
 Only `~/.claude/knowledge-sync/` is created, for this plugin's metadata. `init` is valid even when no native document exists. When a document is later discovered, it is added to the configuration; when one disappears, it is reported as missing rather than recreated or removed.
 
 ## Portable and local facts
 
-Native files remain normal Markdown. Make a fact portable only with an explicit `<common>` block:
+Per-fact memory files use Claude's frontmatter scope. A whole fact file is portable when `metadata.scope` is `common`; any other label keeps it local:
 
 ```markdown
-<common>
-<!-- knowledge-sync:fact name="test workflow" -->
+---
+metadata:
+  scope: common
+---
+
+# Test workflow
 Run focused tests before the full suite.
-<!-- /knowledge-sync:fact -->
-</common>
 ```
 
-Everything else remains local. Mining derives a fact's default scope from the file in which it already lives (`project-memory`, `user-memory`, `user-steering`, or `user-rule`) and records its source document hash. It never moves, replaces, or erases existing memory.
+For free-form steering documents such as `CLAUDE.md` and rule files, use inline `<common>` blocks. Mining reads and records the fact-file scope plus source hash. It never moves, replaces, or erases existing memory.
 
 ## Bootstrap and sync
 
