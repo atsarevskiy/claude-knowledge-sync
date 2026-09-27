@@ -472,6 +472,44 @@ def check(config: dict, kind: str | None = None) -> None:
     print("CHECK OK: only explicit <common> fragments and scope: common fact files are eligible for export.")
 
 
+def analysis_report(config: dict, kind: str | None = None) -> dict:
+    """Return the current analysis gate without treating stale knowledge as synced."""
+    config = scoped_config(config, kind)
+    state = scan_document_state(config)
+    changed = []
+    missing = []
+    for doc_id, value in state.get("documents", {}).items():
+        if value.get("missing"):
+            missing.append(doc_id)
+        elif value.get("hash") != value.get("last_analyzed_hash"):
+            changed.append(doc_id)
+    return {"changed": changed, "missing": missing, "documents": state.get("documents", {})}
+
+
+def require_analysis_current(config: dict, kind: str | None = None, endpoint: str = "local") -> None:
+    report = analysis_report(config, kind)
+    stale = report["changed"]
+    missing = report["missing"]
+    if stale or missing:
+        details = []
+        if stale:
+            details.append("changed but unanalysed: " + ", ".join(stale))
+        if missing:
+            details.append("missing: " + ", ".join(missing))
+        raise SystemExit("SYNC BLOCKED on %s: %s. Run /knowledge-sync:mine-facts there, "
+                         "then rerun sync." % (endpoint, "; ".join(details)))
+
+
+def exported_part_count(bundle_path: Path) -> int:
+    """Count actual eligible payloads; configured local-only docs do not count."""
+    try:
+        bundle = json.loads(bundle_path.read_text())
+        return sum(len(item.get("common", [])) for item in bundle.get("documents", [])
+                   if isinstance(item, dict) and isinstance(item.get("common"), list))
+    except (OSError, json.JSONDecodeError):
+        raise SystemExit(f"Could not inspect generated bundle: {bundle_path}")
+
+
 def export(config: dict, output: Path, kind: str | None = None) -> None:
     config = scoped_config(config, kind)
     check(config)
@@ -517,7 +555,19 @@ def remote_shell(peer: dict, command: str) -> list[str]:
 
 
 def verify_peer(peer: dict) -> None:
-    run(remote_shell(peer, "command -v python3 >/dev/null && command -v rsync >/dev/null"))
+    run(remote_shell(peer, "command -v python3 >/dev/null && command -v rsync >/dev/null && command -v claude >/dev/null"))
+
+
+def remote_analyze(peer: dict, kind: str | None) -> None:
+    """Ask Claude running on the peer to classify its own changed native docs."""
+    kind_args = " --kind " + kind if kind else ""
+    prompt = """Perform only the changed-document analysis for Knowledge Sync on this machine.
+Run `python3 ~/.claude/knowledge-sync/bin/knowledge_sync.py analysis-status%s` and inspect every changed native document it reports. Do not recreate missing documents. For each new per-fact memory file, read `metadata.scope`: common is portable and any other label is local. For a new fact you derive, ask: Does this depend on tools, paths, credentials, services, configuration, or access that exist only on this one machine? A tool name alone is not machine-local. Use scope common when the answer is not clearly yes, but never put a secret in shared knowledge. For free-form steering use inline <common> only for portable content. Snapshot before any edit, never delete or replace facts, then run `check%s`, `mark-analyzed%s`, and `analysis-status%s`. Do not run sync; this caller performs transfer after both machines pass analysis.""" % (kind_args, kind_args, kind_args, kind_args)
+    allowed_tools = "Read,Edit,Write,Bash(python3 ~/.claude/knowledge-sync/bin/knowledge_sync.py *)"
+    command = ("cd \"$HOME\" && claude -p --no-session-persistence "
+               "--permission-mode acceptEdits --permission-prompts none --allowedTools "
+               + shlex.quote(allowed_tools) + " " + shlex.quote(prompt))
+    run(remote_shell(peer, command))
 
 
 def provision_peer(peer: dict, machine: str) -> None:
@@ -572,9 +622,24 @@ def sync(config: dict, peer_name: str, kind: str | None = None, pull: bool = Fal
     peer = next((p for p in config.get("peers", []) if p["name"] == peer_name), None)
     if not peer:
         raise SystemExit(f"Unknown peer: {peer_name}")
+    provision_peer(peer, peer_name)
+    remote_analyze(peer, kind)
+    remote_analysis_args = ["analysis-status"] + (["--kind", kind] if kind else [])
+    try:
+        remote_report = json.loads(output(remote_command(peer, "knowledge_sync.py", *remote_analysis_args)))
+    except (subprocess.CalledProcessError, json.JSONDecodeError) as exc:
+        raise SystemExit("SYNC BLOCKED: could not verify remote analysis status: %s" % exc) from exc
+    if remote_report.get("changed") or remote_report.get("missing"):
+        details = []
+        if remote_report.get("changed"):
+            details.append("changed but unanalysed: " + ", ".join(remote_report["changed"]))
+        if remote_report.get("missing"):
+            details.append("missing: " + ", ".join(remote_report["missing"]))
+        raise SystemExit("SYNC BLOCKED on %s: %s. Run /knowledge-sync:mine-facts on that machine, "
+                         "then rerun sync." % (peer_name, "; ".join(details)))
+    require_analysis_current(config, kind)
     config = scoped_config(config, kind)
     check(config)
-    provision_peer(peer, peer_name)
     remote_check_args = ["check"] + (["--kind", kind] if kind else [])
     run(remote_command(peer, "knowledge_sync.py", *remote_check_args))
     stamp = now()
@@ -587,6 +652,9 @@ def sync(config: dict, peer_name: str, kind: str | None = None, pull: bool = Fal
         run(remote_command(peer, "knowledge_sync.py", *remote_export_args))
         inbound.parent.mkdir(parents=True, exist_ok=True)
         run(["rsync", "-az", "-e", "ssh", f"{peer['ssh_target']}:{remote_return}", str(inbound)])
+        if exported_part_count(inbound) == 0:
+            raise SystemExit("SYNC FAILED LOUDLY: %s has no eligible shared knowledge after analysis; "
+                             "review metadata.scope/common classifications." % peer_name)
         merge(config, inbound)
         log("sync_pull", peer=peer_name, inbound=str(inbound), kind=kind)
         record_sync_state(config, "pull", peer=peer_name, kind=kind, inbound=str(inbound))
@@ -594,6 +662,9 @@ def sync(config: dict, peer_name: str, kind: str | None = None, pull: bool = Fal
         return
     outbound = STATE / "outbound" / peer_name / f"{stamp}.json"
     export(config, outbound)
+    if exported_part_count(outbound) == 0:
+        raise SystemExit("SYNC FAILED LOUDLY: local analysis produced no eligible shared knowledge; "
+                         "review metadata.scope/common classifications.")
     remote_inbox = f".claude/knowledge-sync/inbox/{config['machine']}"
     remote_bundle = f"{remote_inbox}/{stamp}.json"
     run(remote_shell(peer, "mkdir -p " + shlex.quote(remote_inbox)))
@@ -605,6 +676,9 @@ def sync(config: dict, peer_name: str, kind: str | None = None, pull: bool = Fal
     run(remote_command(peer, "knowledge_sync.py", *remote_export_args))
     inbound.parent.mkdir(parents=True, exist_ok=True)
     run(["rsync", "-az", "-e", "ssh", f"{peer['ssh_target']}:{remote_return}", str(inbound)])
+    if exported_part_count(inbound) == 0:
+        raise SystemExit("SYNC FAILED LOUDLY: %s has no eligible shared knowledge after analysis; "
+                         "review metadata.scope/common classifications." % peer_name)
     merge(config, inbound)
     log("sync", peer=peer_name, outbound=str(outbound), inbound=str(inbound))
     record_sync_state(config, "sync", peer=peer_name, kind=kind, outbound=str(outbound), inbound=str(inbound))
@@ -749,20 +823,14 @@ def status(config: dict) -> None:
     print("missing documents: " + (", ".join(missing) if missing else "none"))
 
 
-def analysis_status(config: dict) -> None:
-    state = scan_document_state(config)
-    changed = []
-    missing = []
-    for doc_id, value in state.get("documents", {}).items():
-        if value.get("missing"):
-            missing.append(doc_id)
-        elif value.get("hash") != value.get("last_analyzed_hash"):
-            changed.append(doc_id)
-    print(json.dumps({"changed_or_previously_changed": changed, "missing": missing,
-                      "documents": state.get("documents", {})}, indent=2))
+def analysis_status(config: dict, kind: str | None = None) -> None:
+    report = analysis_report(config, kind)
+    # Keep the legacy key for callers that have not yet upgraded.
+    print(json.dumps({**report, "changed_or_previously_changed": report["changed"]}, indent=2))
 
 
-def mark_analyzed(config: dict) -> None:
+def mark_analyzed(config: dict, kind: str | None = None) -> None:
+    config = scoped_config(config, kind)
     state = scan_document_state(config)
     for value in state.get("documents", {}).values():
         if not value.get("missing") and value.get("hash"):
@@ -798,8 +866,8 @@ def main() -> None:
     p = sub.add_parser("pair"); p.add_argument("--ssh-target", required=True); p.add_argument("--name"); p.add_argument("--machine"); p.add_argument("--register-reverse", action="store_true"); p.add_argument("--local-ssh-target")
     sub.add_parser("discover-environment")
     sub.add_parser("record-machine-facts")
-    sub.add_parser("analysis-status")
-    sub.add_parser("mark-analyzed")
+    p = sub.add_parser("analysis-status"); p.add_argument("--kind", choices=("memory", "steering"))
+    p = sub.add_parser("mark-analyzed"); p.add_argument("--kind", choices=("memory", "steering"))
     p = sub.add_parser("check"); p.add_argument("--kind", choices=("memory", "steering"))
     p = sub.add_parser("snapshot"); p.add_argument("--reason", default="manual snapshot")
     p = sub.add_parser("export"); p.add_argument("--output", type=Path, required=True); p.add_argument("--kind", choices=("memory", "steering"))
@@ -817,8 +885,8 @@ def main() -> None:
     if args.command == "add-peer": return add_peer_command(config, args)
     if args.command == "discover-environment": return discover_environment(config)
     if args.command == "record-machine-facts": return record_machine_facts(config)
-    if args.command == "analysis-status": return analysis_status(config)
-    if args.command == "mark-analyzed": return mark_analyzed(config)
+    if args.command == "analysis-status": return analysis_status(config, args.kind)
+    if args.command == "mark-analyzed": return mark_analyzed(config, args.kind)
     if args.command == "check": return check(config, args.kind)
     if args.command == "snapshot": print(snapshot(config, args.reason)); return
     if args.command == "export": return export(config, args.output, args.kind)

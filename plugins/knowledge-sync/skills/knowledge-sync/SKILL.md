@@ -36,7 +36,7 @@ python3 "$CLAUDE_PLUGIN_ROOT/skills/knowledge-sync/scripts/knowledge_sync.py" in
 python3 "$CLAUDE_PLUGIN_ROOT/skills/knowledge-sync/scripts/knowledge_sync.py" add-peer --name B --ssh-target you@host
 ```
 
-Or use `pair --ssh-target you@host`. It provisions the remote helper under the remote login's `~/.claude/knowledge-sync/`, discovers existing remote native documents, then registers the peer locally. It does not guess a reverse SSH target. Use `--register-reverse --local-ssh-target user@reachable-local-host` only when remote-initiated sync is required.
+Or use `pair --ssh-target you@host`. It provisions the remote helper under the remote login's `~/.claude/knowledge-sync/`, discovers existing remote native documents, then registers the peer locally. It does not guess a reverse SSH target. Use `--register-reverse --local-ssh-target user@reachable-local-host` only when remote-initiated sync is required. Both machines must have the `claude` CLI available: sync invokes Claude on the peer to analyze its changed native documents before transfer.
 
 No native document is required at initialization; later `sync` refreshes discovery. Missing historical documents are reported rather than scaffolded.
 
@@ -58,8 +58,8 @@ Use `/knowledge-sync:mine-facts` on changed documents. Classify existing fact fi
 
 ## Sync procedure
 
-1. Run `check` and correct reported secrets or malformed scopes.
-2. Run `sync --peer B`, optionally with `--kind memory` or `--kind steering`. It checks both endpoints and uses `rsync -az -e ssh` for filtered bundles.
+1. Use `/knowledge-sync:sync B`, `/knowledge-sync:memory B`, or `/knowledge-sync:steering B`. The command analyzes local changes, and `sync` invokes the peer's Claude CLI for its own analysis.
+2. `sync` verifies both analysis states, then uses `rsync -az -e ssh` for filtered bundles. It fails if either side has stale/missing documents or no eligible shared knowledge; it never silently succeeds with a no-op.
 3. Add `--pull` to receive and merge without sending local knowledge.
 4. Inspect `status` and `~/.claude/knowledge-sync/log.jsonl`. Keep both versions of conflicts.
 

@@ -18,9 +18,9 @@ For a per-fact memory file, `metadata.scope` in YAML frontmatter is authoritativ
 
 ## Transfer
 
-`sync --peer <name>` copies the remote helper into the peer's `~/.claude/knowledge-sync/bin/`, then transfers generated bundles with `rsync -az -e ssh` and calls the helper over SSH. A peer contains only a name and SSH target: no workspace path is used.
+`sync --peer <name>` copies the remote helper into the peer's `~/.claude/knowledge-sync/bin/`, calls the peer's `claude` CLI to analyze changed native documents, verifies both analysis states, then transfers generated bundles with `rsync -az -e ssh`. A peer contains only a name and SSH target: no workspace path is used. The remote Claude invocation is restricted to native-document reads/edits and knowledge-sync-helper commands.
 
-Bundles contain shared fragments, source machine, document IDs, and hashes. They exclude full documents, configuration, snapshots, audit logs, environment discovery, and all local-only content. `--pull` performs receive-and-merge only.
+Bundles contain shared fragments, source machine, document IDs, and hashes. They exclude full documents, configuration, snapshots, audit logs, environment discovery, and all local-only content. `--pull` performs receive-and-merge only. Pending analysis, missing documents, a missing peer Claude CLI, or zero eligible shared items are explicit sync failures, not no-ops.
 
 ## Merge and recovery
 
