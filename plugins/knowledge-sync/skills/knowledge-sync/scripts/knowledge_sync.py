@@ -478,24 +478,41 @@ def analysis_report(config: dict, kind: str | None = None) -> dict:
     state = scan_document_state(config)
     changed = []
     missing = []
+    unclassified = []
+    scopes = {"common": 0, "local": 0, "unclassified": 0}
     for doc_id, value in state.get("documents", {}).items():
         if value.get("missing"):
             missing.append(doc_id)
         elif value.get("hash") != value.get("last_analyzed_hash"):
             changed.append(doc_id)
-    return {"changed": changed, "missing": missing, "documents": state.get("documents", {})}
+    for doc in config["documents"]:
+        if document_mode(doc) != "fact-file":
+            continue
+        scope = doc.get("frontmatter_scope")
+        if scope == "common":
+            scopes["common"] += 1
+        elif scope:
+            scopes["local"] += 1
+        else:
+            scopes["unclassified"] += 1
+            unclassified.append(doc["id"])
+    return {"changed": changed, "missing": missing, "unclassified": unclassified,
+            "scope_counts": scopes, "documents": state.get("documents", {})}
 
 
 def require_analysis_current(config: dict, kind: str | None = None, endpoint: str = "local") -> None:
     report = analysis_report(config, kind)
     stale = report["changed"]
     missing = report["missing"]
-    if stale or missing:
+    unclassified = report["unclassified"]
+    if stale or missing or unclassified:
         details = []
         if stale:
             details.append("changed but unanalysed: " + ", ".join(stale))
         if missing:
             details.append("missing: " + ", ".join(missing))
+        if unclassified:
+            details.append("unclassified fact files: " + ", ".join(unclassified))
         raise SystemExit("SYNC BLOCKED on %s: %s. Run /knowledge-sync:mine-facts there, "
                          "then rerun sync." % (endpoint, "; ".join(details)))
 
@@ -562,7 +579,7 @@ def remote_analyze(peer: dict, kind: str | None) -> None:
     """Ask Claude running on the peer to classify its own changed native docs."""
     kind_args = " --kind " + kind if kind else ""
     prompt = """Perform only the changed-document analysis for Knowledge Sync on this machine.
-Run `python3 ~/.claude/knowledge-sync/bin/knowledge_sync.py analysis-status%s` and inspect every changed native document it reports. Do not recreate missing documents. For each new per-fact memory file, read `metadata.scope`: common is portable and any other label is local. For a new fact you derive, ask: Does this depend on tools, paths, credentials, services, configuration, or access that exist only on this one machine? A tool name alone is not machine-local. Use scope common when the answer is not clearly yes, but never put a secret in shared knowledge. For free-form steering use inline <common> only for portable content. Snapshot before any edit, never delete or replace facts, then run `check%s`, `mark-analyzed%s`, and `analysis-status%s`. Do not run sync; this caller performs transfer after both machines pass analysis.""" % (kind_args, kind_args, kind_args, kind_args)
+Run `python3 ~/.claude/knowledge-sync/bin/knowledge_sync.py analysis-status%s` and inspect every changed or unclassified native document it reports. Do not recreate missing documents. Automatically classify every existing per-fact memory file with no `metadata.scope`: use the machine-only dependency question for its existing content, write `metadata.scope: common` when the answer is not clearly yes, otherwise write a local machine label. Do not leave any existing fact file unscoped. A tool name alone is not machine-local. Never put a secret in shared knowledge. Preserve an existing explicit scope unless the user has asked to change it. For free-form steering use inline <common> only for portable content. Snapshot before any edit, never delete or replace facts, then run `check%s`, `mark-analyzed%s`, and `analysis-status%s`. End with the scope counts and changed file IDs. Do not run sync; this caller performs transfer after both machines pass analysis.""" % (kind_args, kind_args, kind_args, kind_args)
     allowed_tools = "Read,Edit,Write,Bash(python3 ~/.claude/knowledge-sync/bin/knowledge_sync.py *)"
     command = ("cd \"$HOME\" && claude -p --no-session-persistence "
                "--permission-mode acceptEdits --permission-prompts none --allowedTools "
@@ -629,12 +646,14 @@ def sync(config: dict, peer_name: str, kind: str | None = None, pull: bool = Fal
         remote_report = json.loads(output(remote_command(peer, "knowledge_sync.py", *remote_analysis_args)))
     except (subprocess.CalledProcessError, json.JSONDecodeError) as exc:
         raise SystemExit("SYNC BLOCKED: could not verify remote analysis status: %s" % exc) from exc
-    if remote_report.get("changed") or remote_report.get("missing"):
+    if remote_report.get("changed") or remote_report.get("missing") or remote_report.get("unclassified"):
         details = []
         if remote_report.get("changed"):
             details.append("changed but unanalysed: " + ", ".join(remote_report["changed"]))
         if remote_report.get("missing"):
             details.append("missing: " + ", ".join(remote_report["missing"]))
+        if remote_report.get("unclassified"):
+            details.append("unclassified fact files: " + ", ".join(remote_report["unclassified"]))
         raise SystemExit("SYNC BLOCKED on %s: %s. Run /knowledge-sync:mine-facts on that machine, "
                          "then rerun sync." % (peer_name, "; ".join(details)))
     require_analysis_current(config, kind)
@@ -831,6 +850,11 @@ def analysis_status(config: dict, kind: str | None = None) -> None:
 
 def mark_analyzed(config: dict, kind: str | None = None) -> None:
     config = scoped_config(config, kind)
+    unclassified = [doc["id"] for doc in config["documents"]
+                    if document_mode(doc) == "fact-file" and doc_path(doc).exists()
+                    and frontmatter_scope(doc_path(doc).read_text()) is None]
+    if unclassified:
+        raise SystemExit("Refusing to mark unclassified fact files as analyzed: " + ", ".join(unclassified))
     state = scan_document_state(config)
     for value in state.get("documents", {}).values():
         if not value.get("missing") and value.get("hash"):
