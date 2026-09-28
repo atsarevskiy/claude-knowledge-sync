@@ -44,7 +44,7 @@ knowledge_sync.py add-peer --name B --ssh-target you@host
 knowledge_sync.py pair --ssh-target you@host
 ```
 
-`pair` copies only the helper and creates its `~/.claude/knowledge-sync/` metadata directory remotely. It discovers the remote machine's existing native documents; it never scaffolds empty memory or `CLAUDE.md` files. Both machines need the `claude` CLI: sync invokes Claude on the peer to analyze changed documents before transfer. Reverse registration is optional and needs an explicit reachable local SSH target.
+`pair` copies only the helper and creates its `~/.claude/knowledge-sync/` metadata directory remotely. It discovers the remote machine's existing native documents; it never scaffolds empty memory or `CLAUDE.md` files. The peer needs only Python 3 and rsync; classification always runs in the initiating local Claude session. Reverse registration is optional and needs an explicit reachable local SSH target.
 
 The exchange uses `rsync -az -e ssh` for filtered bundles and SSH to run the helper. Full documents, configuration, logs, snapshots, environment profiles, and local-only sections are never transferred.
 

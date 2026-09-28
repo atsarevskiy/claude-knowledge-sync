@@ -308,6 +308,11 @@ def init(args: argparse.Namespace) -> None:
             "history_files": [],
             "include_claude_history": True,
         },
+        "classification_rules": {
+            "default_scope": "local",
+            "always_local_patterns": ["(?i)\\b(secret|credential|password|token|private|confidential)\\b"],
+            "always_common_patterns": [],
+        },
     })
     log("initialized", machine=args.machine)
     scan_document_state(load_config())
@@ -572,19 +577,7 @@ def remote_shell(peer: dict, command: str) -> list[str]:
 
 
 def verify_peer(peer: dict) -> None:
-    run(remote_shell(peer, "command -v python3 >/dev/null && command -v rsync >/dev/null && command -v claude >/dev/null"))
-
-
-def remote_analyze(peer: dict, kind: str | None) -> None:
-    """Ask Claude running on the peer to classify its own changed native docs."""
-    kind_args = " --kind " + kind if kind else ""
-    prompt = """Perform only the changed-document analysis for Knowledge Sync on this machine.
-Run `python3 ~/.claude/knowledge-sync/bin/knowledge_sync.py analysis-status%s` and inspect every changed or unclassified native document it reports. Do not recreate missing documents. Automatically classify every existing per-fact memory file with no `metadata.scope`: use the machine-only dependency question for its existing content, write `metadata.scope: common` when the answer is not clearly yes, otherwise write a local machine label. Do not leave any existing fact file unscoped. A tool name alone is not machine-local. Never put a secret in shared knowledge. Preserve an existing explicit scope unless the user has asked to change it. For free-form steering use inline <common> only for portable content. Snapshot before any edit, never delete or replace facts, then run `check%s`, `mark-analyzed%s`, and `analysis-status%s`. End with the scope counts and changed file IDs. Do not run sync; this caller performs transfer after both machines pass analysis.""" % (kind_args, kind_args, kind_args, kind_args)
-    allowed_tools = "Read,Edit,Write,Bash(python3 ~/.claude/knowledge-sync/bin/knowledge_sync.py *)"
-    command = ("cd \"$HOME\" && claude -p --no-session-persistence "
-               "--permission-mode acceptEdits --permission-prompts none --allowedTools "
-               + shlex.quote(allowed_tools) + " " + shlex.quote(prompt))
-    run(remote_shell(peer, command))
+    run(remote_shell(peer, "command -v python3 >/dev/null && command -v rsync >/dev/null"))
 
 
 def provision_peer(peer: dict, machine: str) -> None:
@@ -595,6 +588,153 @@ def provision_peer(peer: dict, machine: str) -> None:
              f"{peer['ssh_target']}:.claude/knowledge-sync/bin/{helper}"])
     run(remote_command(peer, "knowledge_sync.py", "provision", "--machine", machine,
                        "--no-discover-environment"))
+
+
+def stage(args: argparse.Namespace) -> None:
+    """Copy changed/unclassified native documents into local-only helper staging."""
+    config = load_config()
+    refresh_documents(config)
+    config = load_config()
+    selected = scoped_config(config, args.kind)
+    report = analysis_report(selected)
+    wanted = set(report["changed"]) | set(report["unclassified"])
+    folder = STATE / "staging" / args.session
+    files = folder / "files"
+    files.mkdir(parents=True, exist_ok=False)
+    manifest = {"format": 1, "session": args.session, "machine": config["machine"],
+                "kind": args.kind, "documents": [], "scope_counts_before": report["scope_counts"]}
+    for doc in selected["documents"]:
+        if doc["id"] not in wanted or not doc_path(doc).exists():
+            continue
+        source = doc_path(doc)
+        target = files / (doc["id"] + ".md")
+        text = source.read_text()
+        entry = {"id": doc["id"], "path": str(source), "kind": doc.get("kind"),
+                 "mode": document_mode(doc), "sha256": sha256_text(text),
+                 "frontmatter_scope": doc.get("frontmatter_scope")}
+        if SECRET.search(text):
+            entry["withheld_sensitive"] = True
+        else:
+            shutil.copy2(source, target)
+            entry["staged_as"] = str(target.relative_to(folder))
+        manifest["documents"].append(entry)
+    (folder / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
+    log("stage_created", session=args.session, documents=len(manifest["documents"]))
+    print(json.dumps({"session": args.session, "staging": str(folder),
+                      "documents": len(manifest["documents"]), "scope_counts_before": report["scope_counts"]}))
+
+
+def set_frontmatter_scope(path: Path, scope: str) -> None:
+    """Insert or replace only metadata.scope, retaining all other file text."""
+    if not re.fullmatch(r"[A-Za-z][A-Za-z0-9_-]*", scope):
+        raise SystemExit("Invalid planned scope")
+    text = path.read_text()
+    lines = text.splitlines(keepends=True)
+    if not lines or lines[0].strip() != "---":
+        path.write_text("---\nmetadata:\n  scope: %s\n---\n%s" % (scope, text))
+        return
+    end = next((index for index, line in enumerate(lines[1:], 1) if line.strip() in {"---", "..."}), None)
+    if end is None:
+        raise SystemExit(f"Malformed frontmatter: {path}")
+    metadata = next((index for index in range(1, end) if lines[index].strip() == "metadata:"), None)
+    if metadata is None:
+        lines.insert(end, "metadata:\n  scope: %s\n" % scope)
+    else:
+        scope_line = next((index for index in range(metadata + 1, end)
+                           if re.match(r"^\s+scope\s*:", lines[index])), None)
+        if scope_line is None:
+            lines.insert(metadata + 1, "  scope: %s\n" % scope)
+        else:
+            indent = re.match(r"^(\s*)", lines[scope_line]).group(1)
+            lines[scope_line] = indent + "scope: " + scope + "\n"
+    path.write_text("".join(lines))
+
+
+def classification_rules(config: dict) -> dict:
+    defaults = {"default_scope": "local", "always_local_patterns":
+                ["(?i)\\b(secret|credential|password|token|private|confidential)\\b"],
+                "always_common_patterns": []}
+    configured = config.get("classification_rules", {})
+    return {**defaults, **(configured if isinstance(configured, dict) else {})}
+
+
+def scope_allowed(text: str, scope: str, rules: dict) -> None:
+    if scope != "common":
+        return
+    if SECRET.search(text):
+        raise SystemExit("Refusing common scope for sensitive content")
+    patterns = rules.get("always_local_patterns", [])
+    if not isinstance(patterns, list):
+        raise SystemExit("classification_rules.always_local_patterns must be a list")
+    for pattern in patterns:
+        if not isinstance(pattern, str):
+            raise SystemExit("classification rule must be text")
+        try:
+            if re.search(pattern, text):
+                raise SystemExit("Refusing common scope: matched always-local classification rule")
+        except re.error as exc:
+            raise SystemExit(f"Invalid classification rule: {exc}") from exc
+
+
+def apply_stage(args: argparse.Namespace) -> None:
+    """Apply a reviewed scope plan only while every staged source hash still matches."""
+    folder = STATE / "staging" / args.session
+    manifest = read_json(folder / "manifest.json", {})
+    plan = read_json(folder / "plan.json", {})
+    if manifest.get("format") != 1 or plan.get("format") != 1 or plan.get("session") != args.session:
+        raise SystemExit("Missing or invalid staged manifest/plan")
+    config = load_config()
+    refresh_documents(config)
+    config = load_config()
+    by_id = {doc["id"]: doc for doc in config["documents"]}
+    assignments = plan.get("scopes", {})
+    if not isinstance(assignments, dict):
+        raise SystemExit("Invalid plan scopes")
+    if not isinstance(plan.get("rules", {}), dict):
+        raise SystemExit("Invalid plan classification rules")
+    targets = [item for item in manifest.get("documents", []) if item.get("id") in by_id]
+    stale, applicable = [], []
+    for item in targets:
+        source = doc_path(by_id[item["id"]])
+        if not source.exists() or sha256_text(source.read_text()) != item.get("sha256"):
+            stale.append(item["id"])
+        else:
+            applicable.append(item)
+    changing = [item for item in applicable if item.get("mode") == "fact-file"
+                and assignments.get(item["id"]) != frontmatter_scope(doc_path(by_id[item["id"]]).read_text())]
+    if changing:
+        snapshot({**config, "documents": [by_id[item["id"]] for item in changing]},
+                 "before staged scope apply")
+    applied = []
+    for item in applicable:
+        doc = by_id[item["id"]]
+        if item.get("mode") == "fact-file":
+            scope = assignments.get(item["id"])
+            if not isinstance(scope, str):
+                raise SystemExit("Plan must assign every staged fact file a scope")
+            source = doc_path(doc)
+            if item.get("withheld_sensitive") and scope == "common":
+                raise SystemExit(f"Refusing common scope for withheld sensitive file: {item['id']}")
+            staged = (folder / item["staged_as"]).read_text() if item.get("staged_as") else ""
+            scope_allowed(staged, scope, plan.get("rules", {}))
+            set_frontmatter_scope(source, scope)
+            applied.append({"id": item["id"], "scope": scope})
+    refreshed = load_config(); refresh_documents(refreshed); refreshed = load_config()
+    state = scan_document_state(refreshed)
+    for item in applicable:
+        value = state["documents"].get(item["id"])
+        if value and not value.get("missing"):
+            value["last_analyzed_hash"] = value.get("hash")
+            value["last_analyzed_at"] = now()
+    DOCUMENT_STATE.write_text(json.dumps(state, indent=2) + "\n")
+    record_machine_facts(refreshed)
+    record_fact_provenance(refreshed, state)
+    report = analysis_report(refreshed, args.kind)
+    result = {"session": args.session, "applied": applied, "skipped_changed": stale,
+              "scope_counts_after": report["scope_counts"]}
+    (folder / "apply-result.json").write_text(json.dumps(result, indent=2) + "\n")
+    log("stage_applied", **result)
+    print(json.dumps(result))
 
 
 def add_peer(config: dict, name: str, ssh_target: str) -> None:
@@ -611,6 +751,77 @@ def add_peer(config: dict, name: str, ssh_target: str) -> None:
 
 def add_peer_command(config: dict, args: argparse.Namespace) -> None:
     add_peer(config, args.name, args.ssh_target)
+
+
+def stage_peer(config: dict, args: argparse.Namespace) -> None:
+    peer = next((item for item in config.get("peers", []) if item["name"] == args.peer), None)
+    if not peer:
+        raise SystemExit(f"Unknown peer: {args.peer}")
+    session = now()
+    provision_peer(peer, peer["name"])
+    remote_args = ["stage", "--session", session] + (["--kind", args.kind] if args.kind else [])
+    run(remote_command(peer, "knowledge_sync.py", *remote_args))
+    local_folder = STATE / "staging" / args.peer / session
+    local_folder.mkdir(parents=True, exist_ok=False)
+    remote_folder = f".claude/knowledge-sync/staging/{session}/"
+    run(["rsync", "-az", "-e", "ssh", f"{peer['ssh_target']}:{remote_folder}", str(local_folder) + "/"])
+    manifest = read_json(local_folder / "manifest.json", {})
+    if manifest.get("session") != session:
+        raise SystemExit("Peer staging manifest did not match the requested session")
+    manifest["peer"] = args.peer
+    (local_folder / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
+    print(json.dumps({"peer": args.peer, "session": session, "staging": str(local_folder),
+                      "documents": len(manifest.get("documents", [])),
+                      "scope_counts_before": manifest.get("scope_counts_before", {})}, indent=2))
+
+
+def plan_peer(config: dict, args: argparse.Namespace) -> None:
+    folder = STATE / "staging" / args.peer / args.session
+    manifest = read_json(folder / "manifest.json", {})
+    if manifest.get("format") != 1 or manifest.get("session") != args.session:
+        raise SystemExit("Unknown peer staging session")
+    assignments = {}
+    for item in args.scope:
+        if "=" not in item:
+            raise SystemExit("--scope must be DOCUMENT_ID=SCOPE")
+        doc_id, scope = item.split("=", 1)
+        if not re.fullmatch(r"[A-Za-z0-9_-]+", doc_id) or not re.fullmatch(r"[A-Za-z][A-Za-z0-9_-]*", scope):
+            raise SystemExit("Invalid planned scope")
+        assignments[doc_id] = scope
+    required = {item["id"] for item in manifest.get("documents", []) if item.get("mode") == "fact-file"}
+    if set(assignments) != required:
+        raise SystemExit("Plan must assign exactly every staged fact file")
+    rules = classification_rules(config)
+    for item in manifest.get("documents", []):
+        if item.get("mode") == "fact-file":
+            if item.get("withheld_sensitive") and assignments[item["id"]] == "common":
+                raise SystemExit("Withheld sensitive file must remain local")
+            if item.get("staged_as"):
+                scope_allowed((folder / item["staged_as"]).read_text(), assignments[item["id"]], rules)
+    plan = {"format": 1, "session": args.session, "peer": args.peer, "scopes": assignments,
+            "rules": rules, "documents": manifest.get("documents", [])}
+    (folder / "plan.json").write_text(json.dumps(plan, indent=2) + "\n")
+    print(json.dumps(plan, indent=2))
+
+
+def apply_peer(config: dict, args: argparse.Namespace) -> None:
+    peer = next((item for item in config.get("peers", []) if item["name"] == args.peer), None)
+    if not peer:
+        raise SystemExit(f"Unknown peer: {args.peer}")
+    folder = STATE / "staging" / args.peer / args.session
+    plan = folder / "plan.json"
+    if not plan.exists():
+        raise SystemExit("No reviewed plan for this peer staging session")
+    remote_folder = f".claude/knowledge-sync/staging/{args.session}"
+    run(["rsync", "-az", "-e", "ssh", str(plan), f"{peer['ssh_target']}:{remote_folder}/plan.json"])
+    apply_args = ["apply-stage", "--session", args.session] + (["--kind", args.kind] if args.kind else [])
+    result = output(remote_command(peer, "knowledge_sync.py", *apply_args))
+    try:
+        parsed = json.loads(result)
+    except json.JSONDecodeError as exc:
+        raise SystemExit("Peer apply did not return a valid result") from exc
+    (folder / "peer-apply-result.json").write_text(json.dumps(parsed, indent=2) + "\n")
+    print(json.dumps(parsed, indent=2))
 
 
 def pair(args: argparse.Namespace) -> None:
@@ -640,7 +851,6 @@ def sync(config: dict, peer_name: str, kind: str | None = None, pull: bool = Fal
     if not peer:
         raise SystemExit(f"Unknown peer: {peer_name}")
     provision_peer(peer, peer_name)
-    remote_analyze(peer, kind)
     remote_analysis_args = ["analysis-status"] + (["--kind", kind] if kind else [])
     try:
         remote_report = json.loads(output(remote_command(peer, "knowledge_sync.py", *remote_analysis_args)))
@@ -892,6 +1102,11 @@ def main() -> None:
     sub.add_parser("record-machine-facts")
     p = sub.add_parser("analysis-status"); p.add_argument("--kind", choices=("memory", "steering"))
     p = sub.add_parser("mark-analyzed"); p.add_argument("--kind", choices=("memory", "steering"))
+    p = sub.add_parser("stage"); p.add_argument("--session", required=True); p.add_argument("--kind", choices=("memory", "steering"))
+    p = sub.add_parser("apply-stage"); p.add_argument("--session", required=True); p.add_argument("--kind", choices=("memory", "steering"))
+    p = sub.add_parser("stage-peer"); p.add_argument("--peer", required=True); p.add_argument("--kind", choices=("memory", "steering"))
+    p = sub.add_parser("plan-peer"); p.add_argument("--peer", required=True); p.add_argument("--session", required=True); p.add_argument("--scope", action="append", default=[])
+    p = sub.add_parser("apply-peer"); p.add_argument("--peer", required=True); p.add_argument("--session", required=True); p.add_argument("--kind", choices=("memory", "steering"))
     p = sub.add_parser("check"); p.add_argument("--kind", choices=("memory", "steering"))
     p = sub.add_parser("snapshot"); p.add_argument("--reason", default="manual snapshot")
     p = sub.add_parser("export"); p.add_argument("--output", type=Path, required=True); p.add_argument("--kind", choices=("memory", "steering"))
@@ -907,6 +1122,11 @@ def main() -> None:
     refresh_documents(config)
     config = load_config()
     if args.command == "add-peer": return add_peer_command(config, args)
+    if args.command == "stage": return stage(args)
+    if args.command == "apply-stage": return apply_stage(args)
+    if args.command == "stage-peer": return stage_peer(config, args)
+    if args.command == "plan-peer": return plan_peer(config, args)
+    if args.command == "apply-peer": return apply_peer(config, args)
     if args.command == "discover-environment": return discover_environment(config)
     if args.command == "record-machine-facts": return record_machine_facts(config)
     if args.command == "analysis-status": return analysis_status(config, args.kind)

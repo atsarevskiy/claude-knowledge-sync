@@ -18,9 +18,11 @@ For a per-fact memory file, `metadata.scope` in YAML frontmatter is authoritativ
 
 ## Transfer
 
-`sync --peer <name>` copies the remote helper into the peer's `~/.claude/knowledge-sync/bin/`, calls the peer's `claude` CLI to analyze changed native documents, verifies both analysis states, then transfers generated bundles with `rsync -az -e ssh`. A peer contains only a name and SSH target: no workspace path is used. The remote Claude invocation is restricted to native-document reads/edits and knowledge-sync-helper commands.
+`stage-peer --peer <name>` copies the helper into the peer's `~/.claude/knowledge-sync/bin/`, then has the peer helper stage only changed or unclassified documents and a source-hash manifest. `rsync -az -e ssh` copies that temporary staging directory to the initiating machine. Claude runs only on the initiating machine and classifies the staged copies using its local rules. The peer needs only Python 3 and rsync.
 
-Bundles contain shared fragments, source machine, document IDs, and hashes. They exclude full documents, configuration, snapshots, audit logs, environment discovery, and all local-only content. `--pull` performs receive-and-merge only. Pending analysis, missing documents, a missing peer Claude CLI, or zero eligible shared items are explicit sync failures, not no-ops.
+`plan-peer` records a complete reviewed scope plan. `apply-peer` copies that plan back, where the helper snapshots affected files, verifies every live hash against the manifest, skips concurrent edits, and changes only `metadata.scope`. It also records those verified documents as analyzed. `sync --peer <name>` runs only after both endpoints pass analysis and performs the normal filtered-bundle exchange.
+
+Bundles contain shared fragments, source machine, document IDs, and hashes. Staging is a temporary local review copy and contains the peer's changed/unclassified source files plus hashes; it is never exported as a sync bundle. Files matching the built-in secret detector are withheld with only a hash record and cannot be planned as common. `--pull` performs receive-and-merge only. Pending analysis, missing documents, a changed staged source, or zero eligible shared items are explicit sync failures, not no-ops.
 
 ## Merge and recovery
 
