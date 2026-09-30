@@ -14,7 +14,7 @@ import socket
 from pathlib import Path
 from collections import Counter
 from knowledge_sync_state import (
-    CLAUDE_HOME, CONFIG, DOCUMENT_STATE, ENVIRONMENT, FACT_PROVENANCE, LOG,
+    CLAUDE_HOME, CONFIG, DEFAULT_ALWAYS_LOCAL_PATTERNS, DOCUMENT_STATE, ENVIRONMENT, FACT_PROVENANCE, LOG,
     MACHINE_FACTS, STATE, SYNC_STATE, doc_path, load_config, log,
     frontmatter_scope, is_memory_index, is_under, native_documents, now, read_json,
     refresh_documents, write_config,
@@ -310,7 +310,7 @@ def init(args: argparse.Namespace) -> None:
         },
         "classification_rules": {
             "default_scope": "local",
-            "always_local_patterns": ["(?i)\\b(secret|credential|password|token|private|confidential)\\b"],
+            "always_local_patterns": DEFAULT_ALWAYS_LOCAL_PATTERNS,
             "always_common_patterns": [],
         },
     })
@@ -652,28 +652,33 @@ def set_frontmatter_scope(path: Path, scope: str) -> None:
 
 def classification_rules(config: dict) -> dict:
     defaults = {"default_scope": "local", "always_local_patterns":
-                ["(?i)\\b(secret|credential|password|token|private|confidential)\\b"],
+                DEFAULT_ALWAYS_LOCAL_PATTERNS,
                 "always_common_patterns": []}
     configured = config.get("classification_rules", {})
     return {**defaults, **(configured if isinstance(configured, dict) else {})}
 
 
-def scope_allowed(text: str, scope: str, rules: dict) -> None:
-    if scope != "common":
-        return
+def rule_matches(text: str, rules: dict) -> list[str]:
     if SECRET.search(text):
-        raise SystemExit("Refusing common scope for sensitive content")
+        return ["built-in-secret-value-detector"]
     patterns = rules.get("always_local_patterns", [])
     if not isinstance(patterns, list):
         raise SystemExit("classification_rules.always_local_patterns must be a list")
+    matches = []
     for pattern in patterns:
         if not isinstance(pattern, str):
             raise SystemExit("classification rule must be text")
         try:
             if re.search(pattern, text):
-                raise SystemExit("Refusing common scope: matched always-local classification rule")
+                matches.append(pattern)
         except re.error as exc:
             raise SystemExit(f"Invalid classification rule: {exc}") from exc
+    return matches
+
+
+def require_no_real_secret(text: str, scope: str) -> None:
+    if scope == "common" and SECRET.search(text):
+        raise SystemExit("Refusing common scope for a detected secret value")
 
 
 def apply_stage(args: argparse.Namespace) -> None:
@@ -692,6 +697,9 @@ def apply_stage(args: argparse.Namespace) -> None:
         raise SystemExit("Invalid plan scopes")
     if not isinstance(plan.get("rules", {}), dict):
         raise SystemExit("Invalid plan classification rules")
+    force_common = set(plan.get("force_common", []))
+    if not all(isinstance(item, str) for item in force_common):
+        raise SystemExit("Invalid plan force_common entries")
     targets = [item for item in manifest.get("documents", []) if item.get("id") in by_id]
     stale, applicable = [], []
     for item in targets:
@@ -713,10 +721,14 @@ def apply_stage(args: argparse.Namespace) -> None:
             if not isinstance(scope, str):
                 raise SystemExit("Plan must assign every staged fact file a scope")
             source = doc_path(doc)
+            original_scope = item.get("frontmatter_scope")
+            if original_scope is not None and scope != original_scope:
+                if not (original_scope == "common" and item.get("withheld_sensitive") and scope != "common"):
+                    raise SystemExit(f"Refusing to change explicit scope for {item['id']}")
             if item.get("withheld_sensitive") and scope == "common":
                 raise SystemExit(f"Refusing common scope for withheld sensitive file: {item['id']}")
             staged = (folder / item["staged_as"]).read_text() if item.get("staged_as") else ""
-            scope_allowed(staged, scope, plan.get("rules", {}))
+            require_no_real_secret(staged, scope)
             set_frontmatter_scope(source, scope)
             applied.append({"id": item["id"], "scope": scope})
     refreshed = load_config(); refresh_documents(refreshed); refreshed = load_config()
@@ -791,15 +803,39 @@ def plan_peer(config: dict, args: argparse.Namespace) -> None:
     required = {item["id"] for item in manifest.get("documents", []) if item.get("mode") == "fact-file"}
     if set(assignments) != required:
         raise SystemExit("Plan must assign exactly every staged fact file")
+    force_common = set(args.force_common)
+    if not force_common.issubset(required):
+        raise SystemExit("--force-common must name a staged fact file")
     rules = classification_rules(config)
+    warnings = []
     for item in manifest.get("documents", []):
         if item.get("mode") == "fact-file":
-            if item.get("withheld_sensitive") and assignments[item["id"]] == "common":
-                raise SystemExit("Withheld sensitive file must remain local")
-            if item.get("staged_as"):
-                scope_allowed((folder / item["staged_as"]).read_text(), assignments[item["id"]], rules)
+            doc_id = item["id"]
+            original_scope = item.get("frontmatter_scope")
+            requested = assignments[doc_id]
+            if original_scope is not None:
+                if item.get("withheld_sensitive") and original_scope == "common":
+                    assignments[doc_id] = "local"
+                    warnings.append({"id": doc_id, "action": "set-local", "match": "built-in-secret-value-detector"})
+                elif requested != original_scope:
+                    assignments[doc_id] = original_scope
+                    warnings.append({"id": doc_id, "action": "kept-explicit-scope", "scope": original_scope})
+                continue
+            if item.get("withheld_sensitive"):
+                assignments[doc_id] = "local"
+                warnings.append({"id": doc_id, "action": "set-local", "match": "built-in-secret-value-detector"})
+                continue
+            text = (folder / item["staged_as"]).read_text()
+            matches = rule_matches(text, rules)
+            if matches and requested == "common" and doc_id not in force_common:
+                assignments[doc_id] = "local"
+                warnings.append({"id": doc_id, "action": "set-local", "matches": matches})
+            elif matches:
+                warnings.append({"id": doc_id, "action": "force-common", "matches": matches})
+            require_no_real_secret(text, assignments[doc_id])
     plan = {"format": 1, "session": args.session, "peer": args.peer, "scopes": assignments,
-            "rules": rules, "documents": manifest.get("documents", [])}
+            "force_common": sorted(force_common), "warnings": warnings, "rules": rules,
+            "documents": manifest.get("documents", [])}
     (folder / "plan.json").write_text(json.dumps(plan, indent=2) + "\n")
     print(json.dumps(plan, indent=2))
 
@@ -1105,7 +1141,7 @@ def main() -> None:
     p = sub.add_parser("stage"); p.add_argument("--session", required=True); p.add_argument("--kind", choices=("memory", "steering"))
     p = sub.add_parser("apply-stage"); p.add_argument("--session", required=True); p.add_argument("--kind", choices=("memory", "steering"))
     p = sub.add_parser("stage-peer"); p.add_argument("--peer", required=True); p.add_argument("--kind", choices=("memory", "steering"))
-    p = sub.add_parser("plan-peer"); p.add_argument("--peer", required=True); p.add_argument("--session", required=True); p.add_argument("--scope", action="append", default=[])
+    p = sub.add_parser("plan-peer"); p.add_argument("--peer", required=True); p.add_argument("--session", required=True); p.add_argument("--scope", action="append", default=[]); p.add_argument("--force-common", action="append", default=[])
     p = sub.add_parser("apply-peer"); p.add_argument("--peer", required=True); p.add_argument("--session", required=True); p.add_argument("--kind", choices=("memory", "steering"))
     p = sub.add_parser("check"); p.add_argument("--kind", choices=("memory", "steering"))
     p = sub.add_parser("snapshot"); p.add_argument("--reason", default="manual snapshot")

@@ -16,6 +16,10 @@ MACHINE_FACTS = STATE / "machine-facts.json"
 SYNC_STATE = STATE / "sync-state.json"
 DOCUMENT_STATE = STATE / "document-state.json"
 FACT_PROVENANCE = STATE / "fact-provenance.json"
+LEGACY_ALWAYS_LOCAL_PATTERNS = ["(?i)\\b(secret|credential|password|token|private|confidential)\\b"]
+DEFAULT_ALWAYS_LOCAL_PATTERNS = [
+    "(?i)\\b(?:password|passphrase|secret(?:[_ -]?key)?|api[_ -]?key|access[_ -]?token|auth[_ -]?token)\\s*[:=]\\s*['\\\"]?[A-Za-z0-9_./+=-]{12,}"
+]
 
 
 def now() -> str:
@@ -113,6 +117,9 @@ def load_config() -> dict:
 def refresh_documents(config: dict) -> None:
     """Add documents found now but retain historical entries for disappearance alerts."""
     current = {item["id"]: item for item in config.get("documents", [])}
+    rules = config.get("classification_rules")
+    if isinstance(rules, dict) and rules.get("always_local_patterns") == LEGACY_ALWAYS_LOCAL_PATTERNS:
+        rules["always_local_patterns"] = DEFAULT_ALWAYS_LOCAL_PATTERNS
     for item in current.values():
         if is_memory_index(doc_path(item)):
             item["generated_index"] = True
